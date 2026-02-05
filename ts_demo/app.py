@@ -5,7 +5,7 @@ import re
 import html
 import urllib.parse
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -36,24 +36,22 @@ except Exception:
 load_dotenv()
 
 st.set_page_config(page_title="T-S Demo — Files & Facts", layout="wide")
-st.title("T-S Prototype — Files, Facts & Provenance")
+st.title("T-S Prototype — Files, Facts & Provenance (Docs → Facts)")
 
 DB_PATH = os.getenv("TS_DB_PATH", "ts_kb.sqlite3")
 st.caption(f"DB: {DB_PATH}")
 
-# Input dir
 INPUT_DIR = Path("googl_demo_inputs")
 if not INPUT_DIR.exists():
     alt = Path("ts_demo") / "googl_demo_inputs"
     if alt.exists():
         INPUT_DIR = alt
 
-# ---------- DB helpers ----------
+# --- DB helpers ---------------------------------------------------------
 def _get_conn():
     return sqlite3.connect(DB_PATH)
 
 def get_doc_by_sha_safe(sha: Optional[str]):
-    """Return doc row or None. Use get_doc_by_sha if available, else SQL."""
     if not sha:
         return None
     if 'get_doc_by_sha' in globals() and callable(globals()['get_doc_by_sha']):
@@ -127,142 +125,170 @@ def get_fact_resolutions(fact_id: str):
     conn.close()
     return [{"resolution_id": r[0], "resolved_at": r[1], "outcome": bool(r[2]), "confidence": float(r[3]), "evidence": r[4], "method": r[5], "p_pred_at_issue": float(r[6])} for r in rows]
 
-# ---------- text cleaning & robust highlighter ----------
+# --- helper: find local file for doc_id ---------------------------------
+def find_local_file_for_doc_id(doc_id: str) -> Optional[str]:
+    drow = get_doc_by_id(doc_id)
+    if not drow:
+        return None
+    sha = drow.get("sha256")
+    if not sha:
+        return None
+    for f in INPUT_DIR.iterdir():
+        if not f.is_file():
+            continue
+        try:
+            if sha256_file(f) == sha:
+                return str(f.resolve())
+        except Exception:
+            continue
+    return None
+
+# --- robust cleaning & tolerant highlighter -----------------------------
 def _clean_normalised_text_for_display(raw_text: str) -> str:
-    """
-    Conservative cleaning of normalized text for display:
-      - unescape HTML entities first (so &lt;br/&gt; => <br/>),
-      - extract any annotation text from KaTeX (<annotation>...</annotation>) if present,
-      - remove KaTeX/mathml blocks and stray tags,
-      - convert <br/> to newline,
-      - collapse whitespace and trim.
-    Returns plain text.
-    """
     if not raw_text:
         return ""
-
-    # Unescape HTML entities first so '&lt;br/&gt;' becomes '<br/>'
     text = html.unescape(raw_text)
-
-    # Extract textual annotations from MathML/KaTeX if present (these often contain the human-readable text)
-    # We'll keep what's inside <annotation>...</annotation> and drop the rest of KaTeX blocks.
+    # Extract annotations from KaTeX/MathML
     text = re.sub(r"<annotation[^>]*>(.*?)</annotation>", lambda m: m.group(1), text, flags=re.IGNORECASE | re.DOTALL)
-
-    # Remove KaTeX / mathml blocks entirely (they introduce style/HTML that we don't want)
-    text = re.sub(r'<span[^>]*class=["\'][^"\']*katex[^"\']*["\'][^>]*>.*?</span>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
+    # Remove KaTeX/MathML blocks and known style spans
+    text = re.sub(r'<(?:span|div)[^>]*class=["\'][^"\']*(katex|MathJax|math)[^"\']*["\'][^>]*>.*?</(?:span|div)>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'<math[^>]*>.*?</math>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'<annotation[^>]*>.*?</annotation>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
-
-    # Normalise explicit <br/> to newline
+    # Remove italics and style spans that cause red/italic text
+    text = re.sub(r'</?(?:i|em|strong|b)[^>]*>', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'<span[^>]*style=[^>]*>.*?</span>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
+    # Normalize brs -> newline
     text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
-
-    # Remove any remaining tags (replace with space so words remain separated)
+    # Remove remaining tags
     text = re.sub(r"<[^>]+>", " ", text)
-
-    # Unescape again (safety), collapse whitespace, preserve single newlines
     text = html.unescape(text)
+    # Fix glued tokens: digit→letter, letter→digit, lower→Upper
+    text = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", text)
+    text = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", text)
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
+    # Collapse whitespace
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"\n\s*\n+", "\n\n", text)  # collapse multiple blank lines
-    text = re.sub(r"[ \t]+", " ", text)  # collapse spaces/tabs
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
 
-def highlight_text(text: str, phrases_with_ids: List[Tuple[str, str]]) -> str:
-    """
-    Highlight each phrase (with associated fact_id) in the cleaned text with a literal yellow <mark>.
-    Each <mark> is wrapped in an <a href='?fact_id=...'> so clicking it will reload the app with the selected fact.
-    Matching is tolerant: we match sequences of word tokens allowing punctuation/newlines between words.
+def _tokens_of(s: str) -> List[str]:
+    return re.findall(r"\w+", s, flags=re.UNICODE)
 
-    phrases_with_ids: list of (phrase_text, fact_id)
-    """
-    if not text:
-        return ""
+def _first_matching_substring(clean_text: str, phrase: str) -> Optional[Tuple[str, int, int, str]]:
+    words = _tokens_of(phrase)
+    if words:
+        # Try full sequence
+        if len(words) >= 2:
+            pattern = r"\b" + r"\W+".join(re.escape(w) for w in words) + r"\b"
+        else:
+            if len(words[0]) < 3:
+                pattern = None
+            else:
+                pattern = r"\b" + re.escape(words[0]) + r"\b"
+        if pattern:
+            try:
+                m = re.search(pattern, clean_text, flags=re.IGNORECASE | re.DOTALL)
+                if m:
+                    return (m.group(0), m.start(), m.end(), pattern)
+            except re.error:
+                pass
+        # Sliding window fallback
+        L = len(words)
+        max_window = min(8, L)
+        for wlen in range(max_window, 2, -1):
+            for start in range(0, L - wlen + 1):
+                subw = words[start:start + wlen]
+                pat = r"\b" + r"\W+".join(re.escape(w) for w in subw) + r"\b"
+                try:
+                    m = re.search(pat, clean_text, flags=re.IGNORECASE | re.DOTALL)
+                    if m:
+                        return (m.group(0), m.start(), m.end(), pat)
+                except re.error:
+                    continue
+    # fallback literal match
+    try:
+        idx = clean_text.lower().find(phrase.lower())
+        if idx >= 0:
+            return (clean_text[idx:idx+len(phrase)], idx, idx+len(phrase), "literal")
+    except Exception:
+        pass
+    return None
 
+def highlight_text_with_debug(text: str, phrases_with_ids_and_docids: List[Tuple[str,str,Optional[str]]]) -> Tuple[str, List[Dict]]:
     clean_text = _clean_normalised_text_for_display(text)
-    if not phrases_with_ids:
-        return html.escape(clean_text).replace("\n", "<br/>")
+    if not phrases_with_ids_and_docids:
+        return (html.escape(clean_text).replace("\n", "<br/>"), [])
 
-    # prepare unique phrase -> fact mapping, sort by phrase length descending
-    uniq_pairs = []
+    uniq: List[Tuple[str,str,Optional[str]]] = []
     seen = set()
-    for ph, fid in phrases_with_ids:
-        if not ph or not isinstance(ph, str):
+    for item in phrases_with_ids_and_docids:
+        # each item: (phrase, fact_id, doc_id)
+        if not item or not isinstance(item, (list, tuple)) or len(item) < 2:
             continue
-        key = ph.strip()
+        phrase = item[0]
+        fid = item[1]
+        docid = item[2] if len(item) > 2 else None
+        key = (phrase or "").strip()
         if not key or key in seen:
             continue
         seen.add(key)
-        uniq_pairs.append((key, fid))
-    uniq_pairs.sort(key=lambda p: len(p[0]), reverse=True)
-    if not uniq_pairs:
-        return html.escape(clean_text).replace("\n", "<br/>")
+        uniq.append((key, fid, docid))
+    uniq.sort(key=lambda p: len(p[0]), reverse=True)
 
     raw = clean_text
-    placeholder_map = {}
+    placeholder_map: Dict[str,str] = {}
     counter = [0]
+    debug_info = []
 
-    for phrase, fact_id in uniq_pairs:
-        # skip very short phrases
-        if len(phrase.strip()) < 3:
-            continue
-        # tokenise into words
-        words = re.findall(r"\w+", phrase, flags=re.UNICODE)
-        if words and len(words) >= 2:
-            pattern = r"\b" + r"\W+".join(re.escape(w) for w in words) + r"\b"
-        elif words and len(words) == 1:
-            if len(words[0]) < 3:
-                continue
-            pattern = r"\b" + re.escape(words[0]) + r"\b"
-        else:
-            # fallback literal
-            pattern = re.escape(phrase)
-
-        try:
-            pat = re.compile(pattern, flags=re.IGNORECASE | re.DOTALL)
-        except re.error:
-            # fallback to literal
-            try:
-                pat = re.compile(re.escape(phrase), flags=re.IGNORECASE | re.DOTALL)
-            except Exception:
-                continue
-
-        def _repl(m, counter=counter, pm=placeholder_map, fid=fact_id):
+    for phrase, fid, docid in uniq:
+        info = {"phrase": phrase, "fact_id": fid, "doc_id": docid, "matched": False, "matched_substring": None, "pattern": None, "excerpt": None}
+        res = _first_matching_substring(raw, phrase)
+        if res:
+            matched, sidx, eidx, pattern = res
             ph = f"__HL_{counter[0]}__"
-            matched = m.group(0)
-            # anchor with fact_id in query param; URL-encode it
             fid_enc = urllib.parse.quote_plus(str(fid))
-            pm[ph] = f'<a href="?fact_id={fid_enc}"><mark style="background:#fff59d;color:#000;font-weight:normal">{html.escape(matched)}</mark></a>'
+            doc_enc = urllib.parse.quote_plus(str(docid)) if docid else ""
+            anchor = f'<a href="?fact_id={fid_enc}&doc_id={doc_enc}" target="_self" rel="noopener noreferrer"><mark style="background:#fff59d;color:#000;font-weight:normal">{html.escape(matched)}</mark></a>'
+            # Replace only the first occurrence at sidx:eidx (careful with indices after replacements)
+            try:
+                raw = raw[:sidx] + ph + raw[eidx:]
+            except Exception:
+                raw = raw.replace(matched, ph, 1)
+            placeholder_map[ph] = anchor
             counter[0] += 1
-            return ph
+            info.update({"matched": True, "matched_substring": matched, "pattern": pattern, "excerpt": raw[max(0,sidx-80):min(len(raw), eidx+80)]})
+        else:
+            info.update({"matched": False})
+        debug_info.append(info)
 
-        try:
-            raw = pat.sub(_repl, raw)
-        except Exception:
-            continue
-
-    # Escape the whole text and restore placeholders with the <mark> anchors
     esc = html.escape(raw)
-    for ph, marked_html in placeholder_map.items():
+    for ph, anchor in placeholder_map.items():
         esc_ph = html.escape(ph)
-        esc = esc.replace(esc_ph, marked_html)
-
-    # Convert newlines to <br/>
+        esc = esc.replace(esc_ph, anchor)
     esc = esc.replace("\n", "<br/>")
-    return esc
+    wrapper = "<div style='color:#000 !important; font-style:normal !important; font-weight:normal !important;'>" + esc + "</div>"
+    return wrapper, debug_info
 
-# ---------- query-param driven initial selection ----------
-# If the app is opened with ?fact_id=..., select that fact automatically.
+# --- restore selection from query params ---------------------------------
 qparams = st.experimental_get_query_params()
 initial_fact = qparams.get("fact_id", [None])[0]
+initial_doc = qparams.get("doc_id", [None])[0]
 if initial_fact:
     st.session_state["selected_fact"] = initial_fact
+if initial_doc:
+    # find local file for doc_id and set selected_doc if available
+    lf = find_local_file_for_doc_id(initial_doc)
+    if lf:
+        st.session_state["selected_doc"] = lf
 
-# ---------- UI state ----------
+# --- session state -------------------------------------------------------
 if "selected_fact" not in st.session_state:
     st.session_state["selected_fact"] = None
 if "selected_doc" not in st.session_state:
     st.session_state["selected_doc"] = None
 
-# ---------- Layout ----------
+# --- layout --------------------------------------------------------------
 tab_files, tab_unresolved, tab_sources = st.tabs(["Files", "Unresolved forward-looking", "Source reliability"])
 
 with tab_files:
@@ -270,7 +296,7 @@ with tab_files:
     cols = st.columns([1, 2, 2])
     left, middle, right = cols
 
-    # LEFT: files
+    # LEFT files
     with left:
         st.subheader("Local input files")
         if not INPUT_DIR.exists():
@@ -292,10 +318,11 @@ with tab_files:
                     if st.button(label, key=f"file_{f.name}"):
                         st.session_state["selected_doc"] = str(f.resolve())
                         st.session_state["selected_fact"] = None
+                        st.experimental_set_query_params()  # clear query params
                     if docrow:
                         st.caption(f"doc_id: {docrow['doc_id']}  |  ticker: {docrow['ticker']}")
 
-    # MIDDLE: viewer and facts
+    # MIDDLE viewer & facts
     with middle:
         st.subheader("Document viewer & facts")
         sel_doc_path = st.session_state.get("selected_doc")
@@ -322,14 +349,22 @@ with tab_files:
             except Exception as e:
                 raw_text = f"Error reading/normalising file: {e}"
 
-            phrases_with_ids = [(c.get("quote", ""), c.get("fact_id")) for c in claims if c.get("quote")]
-            highlighted_html = highlight_text(raw_text, phrases_with_ids)
+            # build phrase,fact_id,doc_id tuples (docrow may be None)
+            doc_id_for_phrases = docrow["doc_id"] if docrow else None
+            phrases_with_ids_and_docids = [(c.get("quote",""), c.get("fact_id"), doc_id_for_phrases) for c in claims if c.get("quote")]
+            highlighted_html, debug_info = highlight_text_with_debug(raw_text, phrases_with_ids_and_docids)
 
             doc_col, facts_col = st.columns([2.6, 1.4])
 
             with doc_col:
                 st.markdown("### Document text (click highlighted text to open fact)", unsafe_allow_html=True)
-                # Render only the HTML produced by highlight_text (which injects safe <a><mark> fragments)
+                if st.checkbox("Show debug: cleaned text & match report", value=False):
+                    st.markdown("**CLEANED TEXT (head)**")
+                    clean_text = _clean_normalised_text_for_display(raw_text)
+                    st.text_area("cleaned", clean_text[:4000], height=240)
+                    st.markdown("**Match report** (phrase → matched substring or failed)")
+                    for info in debug_info:
+                        st.write(info)
                 st.markdown(highlighted_html, unsafe_allow_html=True)
 
             with facts_col:
@@ -346,17 +381,15 @@ with tab_files:
                             st.markdown(f"<div style='background:#fff59d;padding:8px;border-radius:4px'>{html.escape('['+status+'] '+snippet)}</div>", unsafe_allow_html=True)
                             if st.button("Deselect", key=f"deselect_{fpath.name}_{i}"):
                                 st.session_state["selected_fact"] = None
-                                # clear query param
                                 st.experimental_set_query_params()
                         else:
                             if st.button(f"[{status}] {snippet}", key=f"claim_btn_{fpath.name}_{i}"):
                                 st.session_state["selected_fact"] = fact_id
                                 st.session_state["selected_doc"] = str(fpath.resolve())
-                                # set query param so highlighted anchor clicks and list clicks appear in URL
-                                st.experimental_set_query_params(fact_id=fact_id)
+                                st.experimental_set_query_params(fact_id=fact_id, doc_id=docrow["doc_id"] if docrow else "")
                         st.caption(f"p_true={c.get('p_true_used',0.0):.2f}  delta_aw={c.get('delta_awareness',0.0):.3f}  sim={c.get('best_match_similarity',0.0):.2f}")
 
-    # RIGHT: details
+    # RIGHT details
     with right:
         st.subheader("Fact details & provenance")
         sel_fact = st.session_state.get("selected_fact")
@@ -424,7 +457,6 @@ with tab_files:
                     for r in res:
                         st.write(f"- {r['resolved_at']}: outcome={r['outcome']} confidence={r['confidence']:.2f} method={r['method']}")
                         st.write("  ", r['evidence'])
-
 
 with tab_unresolved:
     st.subheader("Unresolved forward-looking claims")
