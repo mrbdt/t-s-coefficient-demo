@@ -187,19 +187,58 @@ def normalise_to_text(path: Path | str) -> str:
         html = path.read_text(errors="ignore")
         soup = BeautifulSoup(html, "lxml")
 
+        # Drop scripts/styles
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
 
-        for table in soup.find_all("table"):
+        # Remove taxonomy / XBRL href anchors, replace other anchors with their text
+        for a in list(soup.find_all("a")):
+            href = (a.get("href") or "").strip()
+            txt = a.get_text(" ", strip=True)
+            # Remove noisy taxonomy/XBRL links
+            if href.startswith("http://fasb.org") or href.startswith("https://fasb.org") \
+               or href.startswith("http://www.xbrl.org") or href.startswith("https://www.xbrl.org") \
+               or txt.startswith("http://fasb.org") or txt.startswith("http://www.xbrl.org"):
+                a.decompose()
+            else:
+                a.replace_with(txt)
+
+        # Convert inline XBRL (ix:*, ixbrl:*, etc.) into readable markers.
+        # This function is conservative: it does not drop facts, it replaces tags with a readable text line.
+        def _extract_inline_xbrl_as_text(soup_local):
+            for tag in list(soup_local.find_all()):
+                try:
+                    tname = getattr(tag, "name", "").lower() if getattr(tag, "name", None) else ""
+                except Exception:
+                    tname = ""
+                if tname.startswith("ix:") or tname.startswith("ixbrl:") or tname.startswith("xbrli:") or tname.startswith("ixl:"):
+                    # Common inline xbrl attributes; be permissive with attribute naming
+                    concept = tag.get("name") or tag.get("concept") or tag.get("id") or ""
+                    val = tag.get_text(" ", strip=True)
+                    context = tag.get("contextref") or tag.get("contextRef") or ""
+                    unit = tag.get("unitref") or tag.get("unitRef") or ""
+                    decimals = tag.get("decimals") or ""
+                    md = f"[XBRL_FACT] concept={concept} value={val} context={context} unit={unit} decimals={decimals}"
+                    tag.replace_with(md)
+        try:
+            _extract_inline_xbrl_as_text(soup)
+        except Exception:
+            # If something goes wrong, continue — we still have text fallback
+            pass
+
+        # Convert explicit tables to markdown blocks (existing behavior)
+        for table in list(soup.find_all("table")):
             try:
                 md = table_to_markdown_from_bs4(table)
-                md_block = soup.new_tag("p")
-                md_block.string = f"\n\n[START_TABLE]\n{md}\n[END_TABLE]\n\n"
-                table.replace_with(md_block)
+                if md:
+                    md_block = soup.new_tag("p")
+                    md_block.string = f"\n\n[START_TABLE]\n{md}\n[END_TABLE]\n\n"
+                    table.replace_with(md_block)
             except Exception:
                 continue
 
         text = soup.get_text("\n")
+        # Filter out blank lines and trailing spaces
         return "\n".join([line.rstrip() for line in text.splitlines() if line.strip()])
 
     if ext == ".docx":
@@ -873,10 +912,7 @@ def extract_claims_from_chunk(
     max_split_depth: int = 2
 ) -> List[ExtractedClaim]:
     """
-    Extract claims from a chunk. Non-destructive approach:
-    - If structured parse is available, try it (only if probe enabled).
-    - If structured parse fails or is disabled, use responses.create JSON output.
-    - If responses.create fails due to token/context size, split chunk recursively and combine results.
+    Extract claims from a chunk. Non-destructive approach.
     """
     instructions = (
         "You are an expert equity research analyst.\n"
@@ -917,6 +953,7 @@ def extract_claims_from_chunk(
             STRUCTURED_PARSE_ENABLED = False
             print("[LLM] disabling structured parse for remainder of run; will use JSON fallback.")
 
+    # Fallback to JSON-only responses.create
     try:
         print("[LLM] calling responses.create with JSON-only instruction...")
         resp = client.responses.create(
@@ -1070,6 +1107,9 @@ def ingest_document(
     as_of = as_of or timestamp
 
     client = OpenAI()
+    global STRUCTURED_PARSE_ENABLED
+    if STRUCTURED_PARSE_ENABLED:
+        STRUCTURED_PARSE_ENABLED = _supports_structured_parse(client)
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
