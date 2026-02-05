@@ -18,6 +18,10 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 from rapidfuzz import fuzz
 
+import warnings
+from bs4 import XMLParsedAsHTMLWarning
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
 # -----------------------------
 # Environment / Config
 # -----------------------------
@@ -466,6 +470,148 @@ def treat_as_same_fact(embed_sim: float, fuzz_sim: float) -> bool:
 # -----------------------------
 # OpenAI extraction
 # -----------------------------
+# ---------- REPLACE the existing extract_claims_from_chunk(...) entirely with this ----------
+
+def _normalize_evidential(v: str) -> str:
+    if not v or not isinstance(v, str):
+        return "UNSPECIFIED"
+    vv = v.strip().upper()
+    if "REPORT" in vv or "NUMBER" in vv or "REPORTED" in vv:
+        return "REPORTED_NUMBER"
+    if "OPERATION" in vv or "OBSERV" in vv:
+        return "OPERATIONAL_OBSERVATION"
+    if "INTERNAL" in vv or "METRIC" in vv:
+        return "INTERNAL_METRIC"
+    return "UNSPECIFIED"
+
+def _normalize_modality(v: Optional[str]) -> str:
+    if not v:
+        return "ASSERTION"
+    vv = v.strip().upper()
+    for opt in ["FORECAST","INTENTION","CONDITIONAL","RISK","OPINION","ASSERTION"]:
+        if opt in vv:
+            return opt
+    return "ASSERTION"
+
+def _normalize_speaker_role(v: Optional[str]) -> str:
+    if not v:
+        return "OTHER"
+    vv = v.strip().upper()
+    if "COMPANY" in vv or "SEC" in vv or "FORM" in vv:
+        return "COMPANY_OFFICIAL"
+    if "MANAGEMENT" in vv or "CEO" in vv or "CFO" in vv:
+        return "MANAGEMENT"
+    if "ANALYST" in vv or "SELL" in vv or "BUY" in vv:
+        return "ANALYST"
+    return "OTHER"
+
+def parse_raw_claims(data: dict, chunk: str) -> List[ExtractedClaim]:
+    """
+    Defensive mapping from arbitrary JSON returned by the model into our ExtractedClaim objects.
+    Uses sensible defaults for missing fields and normalises enums.
+    """
+    out: List[ExtractedClaim] = []
+    if not isinstance(data, dict):
+        return out
+    raw_claims = data.get("claims") or data.get("items") or []
+    if not isinstance(raw_claims, list):
+        return out
+
+    for rc in raw_claims:
+        if not isinstance(rc, dict):
+            continue
+        claim_text = rc.get("claim") or rc.get("text") or (chunk[:400] + ("..." if len(chunk) > 400 else ""))
+        # Basic defaults
+        polarity = (rc.get("polarity") or "NEUTRAL").upper()
+        if polarity not in {"BULLISH","BEARISH","MIXED","NEUTRAL"}:
+            # try to infer from words
+            pt = claim_text.lower()
+            if any(w in pt for w in ["increase","upside","beat","outperform","grow","gain","benefit"]):
+                polarity = "BULLISH"
+            elif any(w in pt for w in ["decline","drop","miss","slowdown","risk","loss","downside","concern"]):
+                polarity = "BEARISH"
+            else:
+                polarity = "NEUTRAL"
+
+        # numeric fields with safe clamping
+        def _safe_float(k, default):
+            try:
+                v = rc.get(k, default)
+                return float(v) if v is not None else float(default)
+            except Exception:
+                return float(default)
+
+        materiality = max(0.0, min(1.0, _safe_float("materiality_0_1", 0.15)))
+        credibility = max(0.0, min(1.0, _safe_float("credibility_0_1", 0.6)))
+        surprise = max(0.0, min(1.0, _safe_float("surprise_0_1", 0.25)))
+
+        # horizon_profile default / normalise
+        hp = rc.get("horizon_profile") or {}
+        if not isinstance(hp, dict):
+            hp = {}
+        # fallback distribution
+        if sum([float(v) for v in hp.values()]) <= 0:
+            hp = {"1D": 0.2, "1W": 0.25, "1M": 0.25, "3M": 0.15, "1Y":0.10, "3Y":0.05}
+        # normalise
+        s = float(sum(float(hp.get(k,0.0)) for k in HORIZON_BUCKETS))
+        if s <= 0:
+            s = 1.0
+        horizon_profile = {k: float(hp.get(k,0.0))/s for k in HORIZON_BUCKETS}
+
+        rationale = rc.get("rationale") or rc.get("why") or ""
+        quote = rc.get("quote") or rc.get("snippet") or (claim_text if len(claim_text) < 600 else claim_text[:600] + "...")
+
+        # pragmatics defaults
+        is_forward = bool(rc.get("is_forward_looking", False))
+        modality = _normalize_modality(rc.get("modality"))
+        commitment = max(0.0, min(1.0, _safe_float("commitment_0_1", 0.5)))
+        conditionality = max(0.0, min(1.0, _safe_float("conditionality_0_1", 0.0)))
+        evidential = _normalize_evidential(rc.get("evidential_basis") or rc.get("evidence") or "")
+        speaker_role = _normalize_speaker_role(rc.get("speaker_role"))
+
+        # Build ExtractedClaim object with fallback values where possible
+        try:
+            ec = ExtractedClaim(
+                claim=str(claim_text),
+                polarity=polarity,  # pydantic will coerce or validate
+                materiality_0_1=float(materiality),
+                credibility_0_1=float(credibility),
+                surprise_0_1=float(surprise),
+                horizon_profile=horizon_profile,
+                rationale=str(rationale),
+                quote=str(quote),
+
+                is_forward_looking=bool(is_forward),
+                modality=modality,
+                commitment_0_1=float(commitment),
+                conditionality_0_1=float(conditionality),
+                evidential_basis=evidential,
+                speaker_role=speaker_role,
+            )
+            out.append(ec)
+        except Exception as e:
+            # Last-resort fallback: use dict and leave pydantic to convert later if needed
+            out.append(ExtractedClaim(
+                claim=str(claim_text),
+                polarity="NEUTRAL",
+                materiality_0_1=0.15,
+                credibility_0_1=0.6,
+                surprise_0_1=0.25,
+                horizon_profile={"1D": 0.2, "1W": 0.25, "1M": 0.25, "3M": 0.15, "1Y":0.10, "3Y":0.05},
+                rationale=str(rationale),
+                quote=str(quote),
+
+                is_forward_looking=False,
+                modality="ASSERTION",
+                commitment_0_1=0.5,
+                conditionality_0_1=0.0,
+                evidential_basis="UNSPECIFIED",
+                speaker_role="OTHER",
+            ))
+
+    return out
+
+
 def extract_claims_from_chunk(
     client: OpenAI,
     chunk: str,
@@ -493,8 +639,10 @@ def extract_claims_from_chunk(
         f"TEXT:\n{chunk}"
     )
 
-    # Preferred: Structured Outputs parsing (Pydantic) via Responses.parse 
+    # Try Structured Outputs parsing first; if it fails, fall back gracefully.
     try:
+        # give a short debug print so terminal shows progress
+        print("[LLM] structured parse request...")
         resp = client.responses.parse(
             model=OPENAI_MODEL,
             input=[
@@ -505,8 +653,11 @@ def extract_claims_from_chunk(
         )
         parsed: ExtractedClaims = resp.output_parsed
         return parsed.claims
-    except Exception:
-        # Fallback: JSON mode, then parse ourselves (less strict)
+    except Exception as e:
+        print(f"[LLM] structured parse failed ({type(e).__name__}), falling back to tolerant JSON parsing...")
+
+    # Fallback: ask for JSON object, but tolerate partial fields
+    try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
             input=[
@@ -516,8 +667,29 @@ def extract_claims_from_chunk(
             text={"format": {"type": "json_object"}},
         )
         raw = resp.output_text.strip()
-        data = json.loads(raw)
-        return ExtractedClaims(**data).claims
+        # Robust parsing: attempt to load as JSON, else try to extract JSON substring
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # try to find the first {...} block
+            import re
+            m = re.search(r"\{.*\}", raw, flags=re.S)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                except Exception:
+                    data = {"claims": []}
+            else:
+                data = {"claims": []}
+
+        # If schema mismatches, map/normalize to our ExtractedClaim objects
+        parsed_claims = parse_raw_claims(data, chunk)
+        return parsed_claims
+
+    except Exception as e:
+        print(f"[LLM] fallback JSON parsing also failed: {e}")
+        # ultimate safe fallback: return zero claims so ingestion continues
+        return []
 
 
 # -----------------------------
