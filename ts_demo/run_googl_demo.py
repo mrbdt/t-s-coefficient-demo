@@ -56,6 +56,7 @@ DOCS = [
         "timestamp": dt.datetime(2025, 7, 23, 20, 30, 0, tzinfo=dt.timezone.utc),
         "authority": 0.95,
     },
+    """
     {
         "name": "GOOGL_2025_Q2_10Q",
         "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000062/goog-20250630.htm",
@@ -86,6 +87,7 @@ DOCS = [
         "timestamp": dt.datetime(2025, 10, 30, 0, 0, 0, tzinfo=dt.timezone.utc),
         "authority": 1.0,
     },
+    """
 ]
 
 def download(url: str, outpath: Path) -> None:

@@ -72,21 +72,29 @@ def main():
     dates = rets.index
 
     # Prepare contamination flags
+    print(f"Price download window: {start.date().isoformat()} → {end.date().isoformat()}")
+    print(f"Processing {len(events)} events...")
+
     event_days = []
     for doc_id, ts, pred_h in events:
         d = market_event_date(ts)
-        # move to next available trading day in price data
         idx = dates.searchsorted(d)
         if idx >= len(dates):
+            print(f"[eval] Event {doc_id} at {d.date()} after last price date; skipping.")
             continue
         event_days.append((doc_id, ts, pred_h, idx, dates[idx]))
 
     rows = []
+    processed = 0
+    skipped = 0
     for i, (doc_id, ts, pred_h, idx0, d0) in enumerate(event_days):
+        print(f"[eval] ({i+1}/{len(event_days)}) processing event {doc_id} at trading date {d0.date()}...")
         # estimation window: [-120, -20]
         est_start = idx0 - 120
         est_end = idx0 - 20
         if est_start < 0 or est_end <= est_start:
+            print(f"[eval]  - Insufficient estimation window for {doc_id}; skipping.")
+            skipped += 1
             continue
 
         r_stock = rets[args.ticker].iloc[est_start:est_end].to_numpy()
@@ -118,6 +126,9 @@ def main():
             row[f"PRED_{b}"] = float(pred_h.get(b, 0.0))
 
         rows.append(row)
+        processed += 1
+
+    print(f"[eval] Done. Processed: {processed}, Skipped: {skipped}, Total events considered: {len(event_days)}")
 
     df = pd.DataFrame(rows)
     if df.empty:

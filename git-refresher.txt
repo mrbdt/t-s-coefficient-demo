@@ -1,4 +1,4 @@
-
+copying this in as always...
 
 Core mental model (remember this):
 Working Directory → Staging Area → Commit → Remote (GitHub)
@@ -58,7 +58,7 @@ Choose:
 “Accept Incoming”
 or manual edit
 
-*** Undoing mistakes (critical knowledge) ***
+*** Undoing mistakes ***
 Discard uncommitted changes:
 Source Control → right-click file → Discard Changes
 Amend last commit:

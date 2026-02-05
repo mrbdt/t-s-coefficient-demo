@@ -831,9 +831,12 @@ def ingest_document(
 
     # Extract
     extracted: List[ExtractedClaim] = []
-    for ch in chunks:
+    for i, ch in enumerate(chunks):
         print(f"[ingest] Extracting claims from chunk {i+1}/{len(chunks)} ...")
         extracted.extend(extract_claims_from_chunk(client, ch, ticker, doc_type, source_type))
+        # small pause to avoid tiny bursts to the LLM and keep console readable
+        import time
+        time.sleep(0.01)
 
     # Within-doc dedup (embedding)
     merged: List[ExtractedClaim] = []
