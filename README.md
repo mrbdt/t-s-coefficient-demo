@@ -6,8 +6,11 @@ How to use:
 Activate the venv (if not already) (do so within the ts_demo folder):
     source .venv/bin/activate
 
-Re-create a clean DB (for a clear demo):
+(optional) Re-create a clean DB (for a clear demo):
     rm -f ts_kb_GOOGL_demo.sqlite3
+
+(optional) clear the inputs folder (for a clear demo):
+    find googl_demo_inputs -mindepth 1 -delete
 
 Run the ingestion and watch the terminal:
     python run_googl_demo.py

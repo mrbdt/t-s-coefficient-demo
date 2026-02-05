@@ -1,0 +1,22 @@
+[
+  {
+    "name": "GOOGL_2024_10K",
+    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000014/goog-20241231.htm",
+    "suffix": ".html",
+    "ticker": "GOOGL",
+    "doc_type": "10-K",
+    "source_type": "SEC_FILING",
+    "timestamp": "2025-02-05T00:00:00+00:00",
+    "authority": 1.0
+  },
+  {
+    "name": "GOOGL_Q1_2025_EARNINGS_CALL",
+    "url": "https://s206.q4cdn.com/479360582/files/doc_financials/2025/q1/2025-q1-earnings-transcript.pdf",
+    "suffix": ".pdf",
+    "ticker": "GOOGL",
+    "doc_type": "EARNINGS_CALL_TRANSCRIPT",
+    "source_type": "EARNINGS_CALL",
+    "timestamp": "2025-04-24T20:30:00+00:00",
+    "authority": 0.95
+  }
+]

@@ -2,6 +2,7 @@ import datetime as dt
 import os
 import time
 from pathlib import Path
+import json
 
 import requests
 from dotenv import load_dotenv
@@ -15,79 +16,63 @@ OUTDIR.mkdir(parents=True, exist_ok=True)
 
 SEC_UA = os.environ.get("SEC_USER_AGENT", "GOOGL-demo/1.0 (your.email@example.com)")
 
-DOCS = [
-    {
-        "name": "GOOGL_2024_10K",
-        "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000014/goog-20241231.htm",
-        "suffix": ".html",
-        "ticker": "GOOGL",
-        "doc_type": "10-K",
-        "source_type": "SEC_FILING",
-        "timestamp": dt.datetime(2025, 2, 5, 0, 0, 0, tzinfo=dt.timezone.utc),
-        "authority": 1.0,
-    },
-    {
-        "name": "GOOGL_Q1_2025_EARNINGS_CALL",
-        "url": "https://s206.q4cdn.com/479360582/files/doc_financials/2025/q1/2025-q1-earnings-transcript.pdf",
-        "suffix": ".pdf",
-        "ticker": "GOOGL",
-        "doc_type": "EARNINGS_CALL_TRANSCRIPT",
-        "source_type": "EARNINGS_CALL",
-        "timestamp": dt.datetime(2025, 4, 24, 20, 30, 0, tzinfo=dt.timezone.utc),
-        "authority": 0.95,
-    },
-    #{
-    #    "name": "GOOGL_2025_Q1_10Q",
-    #    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000043/goog-20250331.htm",
-    #    "suffix": ".html",
-    #    "ticker": "GOOGL",
-    #    "doc_type": "10-Q",
-    #    "source_type": "SEC_FILING",
-    #    "timestamp": dt.datetime(2025, 4, 25, 0, 0, 0, tzinfo=dt.timezone.utc),
-    #    "authority": 1.0,
-    #},
-    #{
-    #    "name": "GOOGL_Q2_2025_EARNINGS_CALL",
-    #    "url": "https://s206.q4cdn.com/479360582/files/doc_financials/2025/q2/2025-q2-earnings-transcript.pdf",
-    #    "suffix": ".pdf",
-    #    "ticker": "GOOGL",
-    #    "doc_type": "EARNINGS_CALL_TRANSCRIPT",
-    #    "source_type": "EARNINGS_CALL",
-    #    "timestamp": dt.datetime(2025, 7, 23, 20, 30, 0, tzinfo=dt.timezone.utc),
-    #    "authority": 0.95,
-    #},
-    #{
-    #    "name": "GOOGL_2025_Q2_10Q",
-    #    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000062/goog-20250630.htm",
-    #    "suffix": ".html",
-    #    "ticker": "GOOGL",
-    #    "doc_type": "10-Q",
-    #    "source_type": "SEC_FILING",
-    #    "timestamp": dt.datetime(2025, 7, 24, 0, 0, 0, tzinfo=dt.timezone.utc),
-    #    "authority": 1.0,
-    #},
-    #{
-    #    "name": "GOOGL_Q3_2025_EARNINGS_CALL",
-    #    "url": "https://s206.q4cdn.com/479360582/files/doc_events/2025/Oct/29/2025_Q3_Earnings_Transcript.pdf",
-    #    "suffix": ".pdf",
-    #    "ticker": "GOOGL",
-    #    "doc_type": "EARNINGS_CALL_TRANSCRIPT",
-    #   "source_type": "EARNINGS_CALL",
-    #    "timestamp": dt.datetime(2025, 10, 29, 21, 30, 0, tzinfo=dt.timezone.utc),
-    #    "authority": 0.95,
-    #},
-    #{
-    #    "name": "GOOGL_2025_Q3_10Q",
-    #    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000091/goog-20250930.htm",
-    #    "suffix": ".html",
-    #    "ticker": "GOOGL",
-    #    "doc_type": "10-Q",
-    #    "source_type": "SEC_FILING",
-    #    "timestamp": dt.datetime(2025, 10, 30, 0, 0, 0, tzinfo=dt.timezone.utc),
-    #    "authority": 1.0,
-    #},
-    
-]
+import json
+
+def load_docs_from_json(path: str | Path = "googl_docs.json"):
+    """
+    Load a list of doc descriptors from a JSON file and normalise fields:
+      - timestamp -> datetime with tzinfo
+      - suffix defaulted from URL if missing
+      - authority defaulted to 1.0
+    Returns a list of dicts matching the previous DOCS structure.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Docs JSON not found: {p.resolve()}")
+
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    docs = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("Each item in docs JSON must be an object/dict.")
+        # Required: name and url
+        name = item.get("name")
+        url = item.get("url")
+        if not name or not url:
+            raise ValueError("Each doc entry must contain at least 'name' and 'url' fields.")
+        suffix = item.get("suffix")
+        if not suffix:
+            # infer from URL path
+            suf = Path(url).suffix
+            suffix = suf if suf else ".html"
+        ticker = item.get("ticker", "UNKNOWN").upper()
+        doc_type = item.get("doc_type", "UNKNOWN")
+        source_type = item.get("source_type", "SEC_FILING")
+        ts_str = item.get("timestamp")
+        if ts_str:
+            try:
+                timestamp = dt.datetime.fromisoformat(ts_str)
+            except Exception:
+                # try naive parse (no timezone)
+                timestamp = dt.datetime.fromisoformat(ts_str + "+00:00")
+        else:
+            timestamp = dt.datetime.now(dt.timezone.utc)
+        authority = float(item.get("authority", 1.0))
+        docs.append({
+            "name": name,
+            "url": url,
+            "suffix": suffix,
+            "ticker": ticker,
+            "doc_type": doc_type,
+            "source_type": source_type,
+            "timestamp": timestamp,
+            "authority": authority
+        })
+    return docs
+
+# Load docs (default path: googl_docs.json at repo root)
+DOCS_JSON_PATH = os.environ.get("DOCS_JSON_PATH", "docs.json")
+DOCS = load_docs_from_json(DOCS_JSON_PATH)
 
 def download(url: str, outpath: Path) -> None:
     headers = {"User-Agent": SEC_UA} if "sec.gov" in url else {}
