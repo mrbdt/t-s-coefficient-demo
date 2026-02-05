@@ -36,58 +36,57 @@ DOCS = [
         "timestamp": dt.datetime(2025, 4, 24, 20, 30, 0, tzinfo=dt.timezone.utc),
         "authority": 0.95,
     },
-    """
-    {
-        "name": "GOOGL_2025_Q1_10Q",
-        "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000043/goog-20250331.htm",
-        "suffix": ".html",
-        "ticker": "GOOGL",
-        "doc_type": "10-Q",
-        "source_type": "SEC_FILING",
-        "timestamp": dt.datetime(2025, 4, 25, 0, 0, 0, tzinfo=dt.timezone.utc),
-        "authority": 1.0,
-    },
-    {
-        "name": "GOOGL_Q2_2025_EARNINGS_CALL",
-        "url": "https://s206.q4cdn.com/479360582/files/doc_financials/2025/q2/2025-q2-earnings-transcript.pdf",
-        "suffix": ".pdf",
-        "ticker": "GOOGL",
-        "doc_type": "EARNINGS_CALL_TRANSCRIPT",
-        "source_type": "EARNINGS_CALL",
-        "timestamp": dt.datetime(2025, 7, 23, 20, 30, 0, tzinfo=dt.timezone.utc),
-        "authority": 0.95,
-    },
-    {
-        "name": "GOOGL_2025_Q2_10Q",
-        "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000062/goog-20250630.htm",
-        "suffix": ".html",
-        "ticker": "GOOGL",
-        "doc_type": "10-Q",
-        "source_type": "SEC_FILING",
-        "timestamp": dt.datetime(2025, 7, 24, 0, 0, 0, tzinfo=dt.timezone.utc),
-        "authority": 1.0,
-    },
-    {
-        "name": "GOOGL_Q3_2025_EARNINGS_CALL",
-        "url": "https://s206.q4cdn.com/479360582/files/doc_events/2025/Oct/29/2025_Q3_Earnings_Transcript.pdf",
-        "suffix": ".pdf",
-        "ticker": "GOOGL",
-        "doc_type": "EARNINGS_CALL_TRANSCRIPT",
-        "source_type": "EARNINGS_CALL",
-        "timestamp": dt.datetime(2025, 10, 29, 21, 30, 0, tzinfo=dt.timezone.utc),
-        "authority": 0.95,
-    },
-    {
-        "name": "GOOGL_2025_Q3_10Q",
-        "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000091/goog-20250930.htm",
-        "suffix": ".html",
-        "ticker": "GOOGL",
-        "doc_type": "10-Q",
-        "source_type": "SEC_FILING",
-        "timestamp": dt.datetime(2025, 10, 30, 0, 0, 0, tzinfo=dt.timezone.utc),
-        "authority": 1.0,
-    },
-    """
+    #{
+    #    "name": "GOOGL_2025_Q1_10Q",
+    #    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000043/goog-20250331.htm",
+    #    "suffix": ".html",
+    #    "ticker": "GOOGL",
+    #    "doc_type": "10-Q",
+    #    "source_type": "SEC_FILING",
+    #    "timestamp": dt.datetime(2025, 4, 25, 0, 0, 0, tzinfo=dt.timezone.utc),
+    #    "authority": 1.0,
+    #},
+    #{
+    #    "name": "GOOGL_Q2_2025_EARNINGS_CALL",
+    #    "url": "https://s206.q4cdn.com/479360582/files/doc_financials/2025/q2/2025-q2-earnings-transcript.pdf",
+    #    "suffix": ".pdf",
+    #    "ticker": "GOOGL",
+    #    "doc_type": "EARNINGS_CALL_TRANSCRIPT",
+    #    "source_type": "EARNINGS_CALL",
+    #    "timestamp": dt.datetime(2025, 7, 23, 20, 30, 0, tzinfo=dt.timezone.utc),
+    #    "authority": 0.95,
+    #},
+    #{
+    #    "name": "GOOGL_2025_Q2_10Q",
+    #    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000062/goog-20250630.htm",
+    #    "suffix": ".html",
+    #    "ticker": "GOOGL",
+    #    "doc_type": "10-Q",
+    #    "source_type": "SEC_FILING",
+    #    "timestamp": dt.datetime(2025, 7, 24, 0, 0, 0, tzinfo=dt.timezone.utc),
+    #    "authority": 1.0,
+    #},
+    #{
+    #    "name": "GOOGL_Q3_2025_EARNINGS_CALL",
+    #    "url": "https://s206.q4cdn.com/479360582/files/doc_events/2025/Oct/29/2025_Q3_Earnings_Transcript.pdf",
+    #    "suffix": ".pdf",
+    #    "ticker": "GOOGL",
+    #    "doc_type": "EARNINGS_CALL_TRANSCRIPT",
+    #   "source_type": "EARNINGS_CALL",
+    #    "timestamp": dt.datetime(2025, 10, 29, 21, 30, 0, tzinfo=dt.timezone.utc),
+    #    "authority": 0.95,
+    #},
+    #{
+    #    "name": "GOOGL_2025_Q3_10Q",
+    #    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000091/goog-20250930.htm",
+    #    "suffix": ".html",
+    #    "ticker": "GOOGL",
+    #    "doc_type": "10-Q",
+    #    "source_type": "SEC_FILING",
+    #    "timestamp": dt.datetime(2025, 10, 30, 0, 0, 0, tzinfo=dt.timezone.utc),
+    #    "authority": 1.0,
+    #},
+    
 ]
 
 def download(url: str, outpath: Path) -> None:
@@ -124,11 +123,28 @@ def main() -> None:
         print("Doc pred_near_term:", round(res.pred_near_term, 6))
         print("Top 5 claims by |impact_rank|:")
         for c in res.top_claims[:5]:
-            print(
-                f"  - [{c['status']}] impact_rank={c['impact_rank']:+.4f} "
-                f"delta_aw={c['delta_awareness']:.3f} p_true={c['p_true']:.2f} ts_coef={c['ts_coef']:+.3f} :: "
-                f"{c['claim'][:140]}"
-            )
+            # Defensive handling: sometimes an item may be a string (or otherwise malformed).
+            if isinstance(c, dict):
+                status = c.get("status", "UNKNOWN")
+                impact_rank = float(c.get("impact_rank", 0.0))
+                delta_aw = float(c.get("delta_awareness", 0.0))
+                p_true = float(c.get("p_true", 0.0))
+                ts_coef = float(c.get("ts_coef", 0.0))
+                claim_text = str(c.get("claim", ""))[:140]
+            else:
+                # Debug print for unexpected formats (prints once)
+                print("[debug] Warning: top_claim element not a dict; showing raw repr")
+                print(repr(c)[:400])
+                status = "MALFORMED"
+                impact_rank = 0.0
+                delta_aw = 0.0
+                p_true = 0.0
+                ts_coef = 0.0
+                claim_text = str(c)[:140]
+
+            print(f"  - [{status}] impact_rank={impact_rank:+.4f} "
+                  f"delta_aw={delta_aw:.3f} p_true={p_true:.2f} ts_coef={ts_coef:+.3f} :: "
+                  f"{claim_text}")
 
 if __name__ == "__main__":
     main()
