@@ -36,6 +36,7 @@ DOCS = [
         "timestamp": dt.datetime(2025, 4, 24, 20, 30, 0, tzinfo=dt.timezone.utc),
         "authority": 0.95,
     },
+    """
     {
         "name": "GOOGL_2025_Q1_10Q",
         "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000043/goog-20250331.htm",
@@ -56,7 +57,6 @@ DOCS = [
         "timestamp": dt.datetime(2025, 7, 23, 20, 30, 0, tzinfo=dt.timezone.utc),
         "authority": 0.95,
     },
-    """
     {
         "name": "GOOGL_2025_Q2_10Q",
         "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000062/goog-20250630.htm",
@@ -98,6 +98,8 @@ def download(url: str, outpath: Path) -> None:
 
 def main() -> None:
     print("DB:", os.environ.get("TS_DB_PATH"))
+    print("LLM Model Used:", os.environ.get("OPENAI_MODEL"))
+    print("Embed Model Used:", os.environ.get("OPENAI_EMBED_MODEL"))
     for i, d in enumerate(DOCS, start=1):
         path = OUTDIR / f"{i:02d}_{d['name']}{d['suffix']}"
 

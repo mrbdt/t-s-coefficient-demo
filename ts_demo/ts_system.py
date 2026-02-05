@@ -8,6 +8,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
+import re
 
 import numpy as np
 import pdfplumber
@@ -205,25 +206,74 @@ def normalise_to_text(path: Path | str) -> str:
 
         # Convert inline XBRL (ix:*, ixbrl:*, etc.) into readable markers.
         # This function is conservative: it does not drop facts, it replaces tags with a readable text line.
-        def _extract_inline_xbrl_as_text(soup_local):
-            for tag in list(soup_local.find_all()):
+        def _extract_inline_xbrl_as_text(soup) -> None:
+            """
+            Replace inline XBRL tags with readable markers.
+            This function:
+            - treats tags whose tag-name contains a colon (e.g. us-gaap:Revenue) as concepts,
+            - also looks for attributes like 'name' or 'concept',
+            - sanitises the value by removing taxonomy URLs and excessive whitespace,
+            - replaces the tag in-place with a single-line [XBRL_FACT] marker.
+            """
+            def _clean_text(s: str) -> str:
+                if not s:
+                    return ""
+                # remove common taxonomy / xbrl urls entirely
+                s = re.sub(r'https?://(?:www\.)?fasb\.org[^\s]*', '', s)
+                s = re.sub(r'https?://(?:www\.)?xbrl\.org[^\s]*', '', s)
+                s = re.sub(r'https?://[^\s#]*#[^\s]*', '', s)  # catch other fragment URLs
+                # normalise whitespace
+                s = re.sub(r'[\s\n\r]+', ' ', s).strip()
+                return s
+
+            # enumerate tags and replace XBRL-like items
+            for tag in list(soup.find_all()):
+                name = getattr(tag, "name", "") or ""
                 try:
-                    tname = getattr(tag, "name", "").lower() if getattr(tag, "name", None) else ""
+                    lname = name.lower()
                 except Exception:
-                    tname = ""
-                if tname.startswith("ix:") or tname.startswith("ixbrl:") or tname.startswith("xbrli:") or tname.startswith("ixl:"):
-                    # Common inline xbrl attributes; be permissive with attribute naming
+                    lname = ""
+                is_xbrl_like = (":" in name) or lname.startswith("ix:") or lname.startswith("ixbrl:") or lname.startswith("xbrli:")
+                if not is_xbrl_like:
+                    continue
+
+                # concept: prefer the tag name (e.g. us-gaap:Revenue), else attributes 'name'/'concept'/'id'
+                concept = str(name)
+                if not concept or concept.strip() == "":
                     concept = tag.get("name") or tag.get("concept") or tag.get("id") or ""
-                    val = tag.get_text(" ", strip=True)
-                    context = tag.get("contextref") or tag.get("contextRef") or ""
-                    unit = tag.get("unitref") or tag.get("unitRef") or ""
-                    decimals = tag.get("decimals") or ""
-                    md = f"[XBRL_FACT] concept={concept} value={val} context={context} unit={unit} decimals={decimals}"
+                concept = _clean_text(str(concept)).strip()
+
+                # value: text inside tag, cleaned
+                val = _clean_text(tag.get_text(" ", strip=True))
+
+                # context/unit/decimals if present
+                context = _clean_text(tag.get("contextref") or tag.get("contextRef") or tag.get("context") or "")
+                unit = _clean_text(tag.get("unitref") or tag.get("unitRef") or tag.get("unit") or "")
+                decimals = _clean_text(tag.get("decimals") or "")
+
+                # build marker
+                md = f"[XBRL_FACT] concept={concept} value={val}"
+                if context:
+                    md += f" context={context}"
+                if unit:
+                    md += f" unit={unit}"
+                if decimals:
+                    md += f" decimals={decimals}"
+
+                # replace the tag node with the marker
+                try:
                     tag.replace_with(md)
+                except Exception:
+                    # if replace fails, try to insert text and decompose tag
+                    tag.insert_after(md)
+                    tag.decompose()
+
+
+        # Convert inline XBRL facts to readable text (conservative replacement)
         try:
             _extract_inline_xbrl_as_text(soup)
         except Exception:
-            # If something goes wrong, continue — we still have text fallback
+            # if parsing fails, continue — we still have text fallback
             pass
 
         # Convert explicit tables to markdown blocks (existing behavior)
@@ -238,8 +288,22 @@ def normalise_to_text(path: Path | str) -> str:
                 continue
 
         text = soup.get_text("\n")
-        # Filter out blank lines and trailing spaces
-        return "\n".join([line.rstrip() for line in text.splitlines() if line.strip()])
+
+        # FINAL CLEANUP: remove remaining taxonomy URLs / fragments and normalise whitespace
+        # remove fasb/xbrl urls
+        text = re.sub(r'https?://(?:www\.)?fasb\.org[^\s\n]*', '', text)
+        text = re.sub(r'https?://(?:www\.)?xbrl\.org[^\s\n]*', '', text)
+        # remove any remaining fragment URLs that include '#'
+        text = re.sub(r'https?://[^\s\n]*#[^\s\n]*', '', text)
+        # collapse whitespace
+        text = re.sub(r'[\s\n\r]+', ' ', text).strip()
+
+        # Put back sensible newlines for markers and tables
+        text = text.replace('[START_TABLE]', '\n[START_TABLE]').replace('[END_TABLE]', '[END_TABLE]\n')
+        text = text.replace('[XBRL_FACT]', '\n[XBRL_FACT]')
+
+        # Trim and return
+        return text
 
     if ext == ".docx":
         from docx import Document as DocxDocument
