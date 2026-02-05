@@ -3,22 +3,35 @@ import os
 import sqlite3
 import re
 import html
+import urllib.parse
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
 
-# reuse system helpers where useful
-from ts_system import (
-    list_docs,
-    list_doc_claims,
-    list_sources,
-    list_unresolved_forward_looking,
-    resolve_fact,
-    normalise_to_text,
-    sha256_file,
-)
+# Try to import helper functions from ts_system; be robust if some helpers are missing
+try:
+    from ts_system import (
+        list_docs,
+        list_doc_claims,
+        list_sources,
+        list_unresolved_forward_looking,
+        resolve_fact,
+        normalise_to_text,
+        sha256_file,
+        get_doc_by_sha,
+    )
+except Exception:
+    import ts_system as ts_sys  # type: ignore
+    list_docs = getattr(ts_sys, "list_docs")
+    list_doc_claims = getattr(ts_sys, "list_doc_claims")
+    list_sources = getattr(ts_sys, "list_sources")
+    list_unresolved_forward_looking = getattr(ts_sys, "list_unresolved_forward_looking")
+    resolve_fact = getattr(ts_sys, "resolve_fact")
+    normalise_to_text = getattr(ts_sys, "normalise_to_text")
+    sha256_file = getattr(ts_sys, "sha256_file")
+    get_doc_by_sha = getattr(ts_sys, "get_doc_by_sha", None)
 
 load_dotenv()
 
@@ -28,11 +41,9 @@ st.title("T-S Prototype — Files, Facts & Provenance")
 DB_PATH = os.getenv("TS_DB_PATH", "ts_kb.sqlite3")
 st.caption(f"DB: {DB_PATH}")
 
-# Directory where run_googl_demo downloads inputs
-# Adjust this if you keep them under ts_demo/googl_demo_inputs
+# Input dir
 INPUT_DIR = Path("googl_demo_inputs")
 if not INPUT_DIR.exists():
-    # also try the ts_demo subdir pattern (some earlier runs used that)
     alt = Path("ts_demo") / "googl_demo_inputs"
     if alt.exists():
         INPUT_DIR = alt
@@ -41,22 +52,29 @@ if not INPUT_DIR.exists():
 def _get_conn():
     return sqlite3.connect(DB_PATH)
 
-def get_doc_by_sha(sha: str):
-    """Return doc row (doc_id, ticker, doc_type, source_type, timestamp, sha256, url) or None."""
-    cur = _get_conn().cursor()
-    cur.execute("SELECT doc_id,ticker,doc_type,source_type,timestamp,sha256,url FROM docs WHERE sha256 = ?", (sha,))
+def get_doc_by_sha_safe(sha: Optional[str]):
+    """Return doc row or None. Use get_doc_by_sha if available, else SQL."""
+    if not sha:
+        return None
+    if 'get_doc_by_sha' in globals() and callable(globals()['get_doc_by_sha']):
+        try:
+            return globals()['get_doc_by_sha'](sha)
+        except Exception:
+            pass
+    conn = _get_conn()
+    cur = conn.execute("SELECT doc_id,ticker,doc_type,source_type,timestamp,sha256,url FROM docs WHERE sha256 = ?", (sha,))
     row = cur.fetchone()
-    cur.connection.close()
+    conn.close()
     if not row:
         return None
     keys = ["doc_id","ticker","doc_type","source_type","timestamp","sha256","url"]
     return dict(zip(keys, row))
 
 def get_doc_by_id(doc_id: str):
-    cur = _get_conn().cursor()
-    cur.execute("SELECT doc_id,ticker,doc_type,source_type,timestamp,sha256,url FROM docs WHERE doc_id = ?", (doc_id,))
+    conn = _get_conn()
+    cur = conn.execute("SELECT doc_id,ticker,doc_type,source_type,timestamp,sha256,url FROM docs WHERE doc_id = ?", (doc_id,))
     row = cur.fetchone()
-    cur.connection.close()
+    conn.close()
     if not row:
         return None
     keys = ["doc_id","ticker","doc_type","source_type","timestamp","sha256","url"]
@@ -109,91 +127,120 @@ def get_fact_resolutions(fact_id: str):
     conn.close()
     return [{"resolution_id": r[0], "resolved_at": r[1], "outcome": bool(r[2]), "confidence": float(r[3]), "evidence": r[4], "method": r[5], "p_pred_at_issue": float(r[6])} for r in rows]
 
-# ---------- utilities ----------
-def highlight_text(text: str, phrases: List[str]) -> str:
+# ---------- text cleaning & robust highlighter ----------
+def _clean_normalised_text_for_display(raw_text: str) -> str:
     """
-    Robust highlighting that tolerates punctuation/line-break differences.
+    Conservative cleaning of normalized text for display:
+      - unescape HTML entities first (so &lt;br/&gt; => <br/>),
+      - extract any annotation text from KaTeX (<annotation>...</annotation>) if present,
+      - remove KaTeX/mathml blocks and stray tags,
+      - convert <br/> to newline,
+      - collapse whitespace and trim.
+    Returns plain text.
+    """
+    if not raw_text:
+        return ""
 
-    Strategy:
-      - For each phrase, extract word-tokens (\w+). If there are >=2 word tokens,
-        build a pattern that matches those words in order, allowing arbitrary
-        non-word characters between them (so punctuation and line breaks don't stop matches).
-      - If phrase contains no word tokens, fall back to a direct literal match.
-      - Sort phrases longest-first to avoid partial/shorter matches shadowing longer ones.
-      - Replace matches in the *raw* text with placeholders, capture the exact matched substring
-        (so we preserve original casing and punctuation), then escape the whole document
-        and substitute placeholders with <mark>HTML of the escaped matched text.
+    # Unescape HTML entities first so '&lt;br/&gt;' becomes '<br/>'
+    text = html.unescape(raw_text)
+
+    # Extract textual annotations from MathML/KaTeX if present (these often contain the human-readable text)
+    # We'll keep what's inside <annotation>...</annotation> and drop the rest of KaTeX blocks.
+    text = re.sub(r"<annotation[^>]*>(.*?)</annotation>", lambda m: m.group(1), text, flags=re.IGNORECASE | re.DOTALL)
+
+    # Remove KaTeX / mathml blocks entirely (they introduce style/HTML that we don't want)
+    text = re.sub(r'<span[^>]*class=["\'][^"\']*katex[^"\']*["\'][^>]*>.*?</span>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<math[^>]*>.*?</math>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<annotation[^>]*>.*?</annotation>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
+
+    # Normalise explicit <br/> to newline
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
+
+    # Remove any remaining tags (replace with space so words remain separated)
+    text = re.sub(r"<[^>]+>", " ", text)
+
+    # Unescape again (safety), collapse whitespace, preserve single newlines
+    text = html.unescape(text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n\s*\n+", "\n\n", text)  # collapse multiple blank lines
+    text = re.sub(r"[ \t]+", " ", text)  # collapse spaces/tabs
+    return text.strip()
+
+def highlight_text(text: str, phrases_with_ids: List[Tuple[str, str]]) -> str:
+    """
+    Highlight each phrase (with associated fact_id) in the cleaned text with a literal yellow <mark>.
+    Each <mark> is wrapped in an <a href='?fact_id=...'> so clicking it will reload the app with the selected fact.
+    Matching is tolerant: we match sequences of word tokens allowing punctuation/newlines between words.
+
+    phrases_with_ids: list of (phrase_text, fact_id)
     """
     if not text:
         return ""
 
-    # If no phrases, just escape and return with line breaks converted
-    if not phrases:
-        return html.escape(text).replace("\n", "<br/>")
+    clean_text = _clean_normalised_text_for_display(text)
+    if not phrases_with_ids:
+        return html.escape(clean_text).replace("\n", "<br/>")
 
-    # Prepare unique phrases, sorted by length (long->short)
-    uniq_phrases = [p for p in sorted({(p or "").strip() for p in phrases if p and isinstance(p, str)}, key=len, reverse=True)]
-    if not uniq_phrases:
-        return html.escape(text).replace("\n", "<br/>")
-
-    raw = text  # operate on original raw text
-    placeholder_map = {}
-    idx = [0]  # mutable counter used in nested repl
-
-    for phrase in uniq_phrases:
-        if not phrase:
+    # prepare unique phrase -> fact mapping, sort by phrase length descending
+    uniq_pairs = []
+    seen = set()
+    for ph, fid in phrases_with_ids:
+        if not ph or not isinstance(ph, str):
             continue
+        key = ph.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        uniq_pairs.append((key, fid))
+    uniq_pairs.sort(key=lambda p: len(p[0]), reverse=True)
+    if not uniq_pairs:
+        return html.escape(clean_text).replace("\n", "<br/>")
 
-        # Extract word tokens; prefer multi-word patterns
+    raw = clean_text
+    placeholder_map = {}
+    counter = [0]
+
+    for phrase, fact_id in uniq_pairs:
+        # skip very short phrases
+        if len(phrase.strip()) < 3:
+            continue
+        # tokenise into words
         words = re.findall(r"\w+", phrase, flags=re.UNICODE)
-        pat = None
+        if words and len(words) >= 2:
+            pattern = r"\b" + r"\W+".join(re.escape(w) for w in words) + r"\b"
+        elif words and len(words) == 1:
+            if len(words[0]) < 3:
+                continue
+            pattern = r"\b" + re.escape(words[0]) + r"\b"
+        else:
+            # fallback literal
+            pattern = re.escape(phrase)
+
         try:
-            if len(words) >= 2:
-                # pattern: word1 \W+ word2 \W+ word3 ... with word boundaries
-                escaped_words = [re.escape(w) for w in words]
-                pattern = r"\b" + r"\W+".join(escaped_words) + r"\b"
-                pat = re.compile(pattern, flags=re.IGNORECASE | re.DOTALL)
-            elif len(words) == 1:
-                # single word: only match if the word is reasonably long (avoid ultra-common short words)
-                if len(words[0]) >= 3:
-                    pattern = r"\b" + re.escape(words[0]) + r"\b"
-                    pat = re.compile(pattern, flags=re.IGNORECASE | re.DOTALL)
-                else:
-                    # skip short single-word phrases as they will produce many false positives
-                    pat = None
-            else:
-                # no word tokens, fallback to literal match of phrase
-                pat = re.compile(re.escape(phrase), flags=re.IGNORECASE | re.DOTALL)
+            pat = re.compile(pattern, flags=re.IGNORECASE | re.DOTALL)
         except re.error:
-            # If building the pattern fails for any reason, fallback to escaped literal
+            # fallback to literal
             try:
                 pat = re.compile(re.escape(phrase), flags=re.IGNORECASE | re.DOTALL)
             except Exception:
-                pat = None
+                continue
 
-        if not pat:
-            continue
-
-        # Replacement function: create a placeholder and store escaped matched text
-        def _repl(m, idx=idx, pm=placeholder_map):
-            ph = f"__HL_{idx[0]}__"
+        def _repl(m, counter=counter, pm=placeholder_map, fid=fact_id):
+            ph = f"__HL_{counter[0]}__"
             matched = m.group(0)
-            # Store the HTML-escaped matched substring wrapped in <mark>
-            pm[ph] = f'<mark style="background:#fff3bf">{html.escape(matched)}</mark>'
-            idx[0] += 1
+            # anchor with fact_id in query param; URL-encode it
+            fid_enc = urllib.parse.quote_plus(str(fid))
+            pm[ph] = f'<a href="?fact_id={fid_enc}"><mark style="background:#fff59d;color:#000;font-weight:normal">{html.escape(matched)}</mark></a>'
+            counter[0] += 1
             return ph
 
-        # Substitute in raw text
         try:
             raw = pat.sub(_repl, raw)
         except Exception:
-            # if substitution fails, continue without replacing this phrase
             continue
 
-    # Escape the document (placeholders will be escaped too)
+    # Escape the whole text and restore placeholders with the <mark> anchors
     esc = html.escape(raw)
-
-    # Replace escaped placeholders with the safe <mark> HTML we recorded
     for ph, marked_html in placeholder_map.items():
         esc_ph = html.escape(ph)
         esc = esc.replace(esc_ph, marked_html)
@@ -201,6 +248,13 @@ def highlight_text(text: str, phrases: List[str]) -> str:
     # Convert newlines to <br/>
     esc = esc.replace("\n", "<br/>")
     return esc
+
+# ---------- query-param driven initial selection ----------
+# If the app is opened with ?fact_id=..., select that fact automatically.
+qparams = st.experimental_get_query_params()
+initial_fact = qparams.get("fact_id", [None])[0]
+if initial_fact:
+    st.session_state["selected_fact"] = initial_fact
 
 # ---------- UI state ----------
 if "selected_fact" not in st.session_state:
@@ -216,7 +270,7 @@ with tab_files:
     cols = st.columns([1, 2, 2])
     left, middle, right = cols
 
-    # LEFT: list files from input directory
+    # LEFT: files
     with left:
         st.subheader("Local input files")
         if not INPUT_DIR.exists():
@@ -231,21 +285,17 @@ with tab_files:
                         sha = sha256_file(f)
                     except Exception:
                         sha = None
-                    docrow = get_doc_by_sha(sha) if sha else None
+                    docrow = get_doc_by_sha_safe(sha) if sha else None
                     label = f.name
                     if docrow:
                         label += f"  ({docrow['doc_type']} | {docrow['timestamp']})"
-                    # clickable select file
                     if st.button(label, key=f"file_{f.name}"):
                         st.session_state["selected_doc"] = str(f.resolve())
-                        # clear fact selection
                         st.session_state["selected_fact"] = None
-
-                    # show small metadata
                     if docrow:
                         st.caption(f"doc_id: {docrow['doc_id']}  |  ticker: {docrow['ticker']}")
 
-    # MIDDLE: show selected document (left) and EXTRACTED FACTS (right) in separate columns
+    # MIDDLE: viewer and facts
     with middle:
         st.subheader("Document viewer & facts")
         sel_doc_path = st.session_state.get("selected_doc")
@@ -254,71 +304,72 @@ with tab_files:
         else:
             fpath = Path(sel_doc_path)
             st.markdown(f"**File:** `{fpath.name}`")
-            # compute sha and match doc
             try:
                 sha = sha256_file(fpath)
-                docrow = get_doc_by_sha(sha)
+                docrow = get_doc_by_sha_safe(sha)
             except Exception as e:
                 st.error(f"Error reading file: {e}")
                 docrow = None
-
-            # show doc metadata / warning
             if docrow:
                 st.caption(f"doc_id: {docrow['doc_id']}  |  ticker: {docrow['ticker']}")
             else:
                 st.caption("This file hasn't been ingested (no matching sha in DB).")
 
-            # Get claims for this document (if any)
             claims = list_doc_claims(docrow["doc_id"]) if docrow else []
 
-            # Read and normalise the document text
             try:
                 raw_text = normalise_to_text(fpath)
             except Exception as e:
                 raw_text = f"Error reading/normalising file: {e}"
 
-            # Build list of quote snippets to highlight
-            phrases = [c.get("quote","") for c in claims if c.get("quote")]
+            phrases_with_ids = [(c.get("quote", ""), c.get("fact_id")) for c in claims if c.get("quote")]
+            highlighted_html = highlight_text(raw_text, phrases_with_ids)
 
-            # Layout: two columns side-by-side: left = text, right = facts list + details
-            doc_col, facts_col = st.columns([2.5, 1.5])
+            doc_col, facts_col = st.columns([2.6, 1.4])
 
-            # LEFT: Document text (with highlights)
             with doc_col:
-                st.markdown("### Document text (highlighted facts shown in yellow)", unsafe_allow_html=True)
-                highlighted_html = highlight_text(raw_text, phrases)
+                st.markdown("### Document text (click highlighted text to open fact)", unsafe_allow_html=True)
+                # Render only the HTML produced by highlight_text (which injects safe <a><mark> fragments)
                 st.markdown(highlighted_html, unsafe_allow_html=True)
 
-            # RIGHT: Extracted facts (compact list) and selection to view details
             with facts_col:
                 st.markdown("### Extracted facts from this file")
                 if not claims:
                     st.write("No extracted claims found for this document.")
                 else:
-                    # show list of claims as clickable rows
                     for i, c in enumerate(claims):
                         fact_id = c.get("fact_id")
-                        status = c.get("status","UNKNOWN")
-                        snippet = (c.get("claim") or "")[:180]
-                        btn_key = f"claim_btn_{fpath.name}_{i}"
-                        if st.button(f"[{status}] {snippet}", key=btn_key):
-                            st.session_state["selected_fact"] = fact_id
-                            st.session_state["selected_doc"] = str(fpath.resolve())
+                        status = c.get("status", "UNKNOWN")
+                        snippet = (c.get("claim") or "")[:200]
+                        is_selected = (fact_id == st.session_state.get("selected_fact"))
+                        if is_selected:
+                            st.markdown(f"<div style='background:#fff59d;padding:8px;border-radius:4px'>{html.escape('['+status+'] '+snippet)}</div>", unsafe_allow_html=True)
+                            if st.button("Deselect", key=f"deselect_{fpath.name}_{i}"):
+                                st.session_state["selected_fact"] = None
+                                # clear query param
+                                st.experimental_set_query_params()
+                        else:
+                            if st.button(f"[{status}] {snippet}", key=f"claim_btn_{fpath.name}_{i}"):
+                                st.session_state["selected_fact"] = fact_id
+                                st.session_state["selected_doc"] = str(fpath.resolve())
+                                # set query param so highlighted anchor clicks and list clicks appear in URL
+                                st.experimental_set_query_params(fact_id=fact_id)
                         st.caption(f"p_true={c.get('p_true_used',0.0):.2f}  delta_aw={c.get('delta_awareness',0.0):.3f}  sim={c.get('best_match_similarity',0.0):.2f}")
 
-    # RIGHT: fact detail panel
+    # RIGHT: details
     with right:
         st.subheader("Fact details & provenance")
         sel_fact = st.session_state.get("selected_fact")
         if not sel_fact:
-            st.info("Click a fact in the document pane to see provenance and details.")
+            st.info("Click a fact in the middle column or a highlighted text in the document to see provenance and details.")
         else:
             fact = get_fact_overview(sel_fact)
             if not fact:
                 st.error("Fact not found in DB.")
             else:
-                st.markdown(f"### Fact `{fact['fact_id']}`")
-                st.markdown(f"**Text:** {fact['canonical_text']}")
+                st.markdown(f"<div style='background:#fff59d;padding:10px;border-radius:6px'>", unsafe_allow_html=True)
+                st.markdown(f"### Fact `{fact['fact_id']}`", unsafe_allow_html=True)
+                st.markdown(f"<b>Text:</b> {html.escape(fact.get('canonical_text',''))}", unsafe_allow_html=True)
                 st.write("**TS_coef:**", fact.get("ts_coef"))
                 st.write("**P_true (latest):**", fact.get("p_true_latest"))
                 st.write("**P_true (at issue):**", fact.get("p_true_at_issue"))
@@ -331,6 +382,7 @@ with tab_files:
                     "conditionality": fact.get("conditionality"),
                     "evidential_basis": fact.get("evidential_basis")
                 })
+                st.markdown("</div>", unsafe_allow_html=True)
 
                 st.markdown("---")
                 st.markdown("#### Occurrences (where this fact appears)")
@@ -338,21 +390,16 @@ with tab_files:
                 if not occs:
                     st.write("No occurrences.")
                 else:
-                    # Show earliest occurrence first and mark which is current selected_doc if applicable
                     for o in occs:
                         with st.expander(f"{o['timestamp']} | {o['doc_type']} | {o['doc_id']}"):
                             st.write("status:", o["status"])
                             st.write("similarity:", f"{o['best_match_similarity']:.3f}")
                             st.write("delta_awareness:", f"{o['delta_awareness']:.3f}")
                             st.write("pred_total:", f"{o['pred_total']:.6f}")
-                            # show who said it (source_id) and whether earlier than selected doc
-                            st.write("doc reference:", o["doc_id"])
-                            # link back to the documents pane by setting session state
+                            st.write("doc reference:", o['doc_id'])
                             if st.button(f"Open document {o['doc_id']}", key=f"open_doc_{o['doc_id']}"):
-                                # fetch doc sha to map to local file if present
                                 drow = get_doc_by_id(o['doc_id'])
                                 if drow and drow.get("sha256"):
-                                    # search for file with same sha
                                     candidate = None
                                     for f in INPUT_DIR.iterdir():
                                         try:
