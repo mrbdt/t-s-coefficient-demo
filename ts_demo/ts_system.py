@@ -160,7 +160,8 @@ def table_to_markdown_from_list(table: List[List[str]]) -> str:
     return "\n".join(md_lines)
 
 
-def normalise_to_text(path: Path) -> str:
+def normalise_to_text(path: Path | str) -> str:
+    path = Path(path)
     ext = path.suffix.lower()
 
     if ext == ".pdf":
