@@ -6,3 +6,6 @@ __pycache__/
 
 # virtualenv
 .venv/
+
+# the cheatsheet
+git-refresher.txt
