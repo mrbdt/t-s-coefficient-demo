@@ -14,7 +14,7 @@ load_dotenv()
 OUTDIR = Path("googl_demo_inputs")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-SEC_UA = os.environ.get("SEC_USER_AGENT", "GOOGL-demo/1.0 (your.email@example.com)")
+SEC_UA = os.environ.get("SEC_USER_AGENT", "GOOGL-demo/1.0 (my.email@example.com)")
 
 import json
 
