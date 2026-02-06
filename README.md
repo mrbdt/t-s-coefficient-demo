@@ -20,3 +20,5 @@ Run evaluation:
     
 Run UI:
     streamlit run app.py
+
+NB: The current codebase contains some elements that are AI generated and not well labelled as such. these elements will either be removed, altered or labelled in a future iteration.

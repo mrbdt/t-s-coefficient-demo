@@ -4,6 +4,7 @@ import sqlite3
 import re
 import html
 import urllib.parse
+import textwrap
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
@@ -125,6 +126,31 @@ def get_fact_resolutions(fact_id: str):
     conn.close()
     return [{"resolution_id": r[0], "resolved_at": r[1], "outcome": bool(r[2]), "confidence": float(r[3]), "evidence": r[4], "method": r[5], "p_pred_at_issue": float(r[6])} for r in rows]
 
+def get_ts_coefs_for_fact_ids(fact_ids: List[str]) -> Dict[str, float]:
+    """
+    Fetch ts_coef for a list of fact_ids in one query.
+    Returns dict: fact_id -> ts_coef
+    """
+    ids = [x for x in fact_ids if x]
+    if not ids:
+        return {}
+    uniq = sorted(set(ids))
+    placeholders = ",".join(["?"] * len(uniq))
+    q = f"SELECT fact_id, ts_coef FROM facts WHERE fact_id IN ({placeholders})"
+    conn = _get_conn()
+    cur = conn.execute(q, tuple(uniq))
+    rows = cur.fetchall()
+    conn.close()
+    out: Dict[str, float] = {}
+    for fid, ts in rows:
+        try:
+            out[str(fid)] = float(ts)
+        except Exception:
+            out[str(fid)] = 0.0
+    for fid in uniq:
+        out.setdefault(fid, 0.0)
+    return out
+
 # --- helper: find local file for doc_id ---------------------------------
 def find_local_file_for_doc_id(doc_id: str) -> Optional[str]:
     drow = get_doc_by_id(doc_id)
@@ -215,51 +241,183 @@ def _first_matching_substring(clean_text: str, phrase: str) -> Optional[Tuple[st
         pass
     return None
 
-def highlight_text_with_debug(text: str, phrases_with_ids_and_docids: List[Tuple[str,str,Optional[str]]]) -> Tuple[str, List[Dict]]:
+# --- TS coefficient colour scale (NOT blue/gray/red) ---------------------
+# Diverging palette:
+#   negative -> violet tint
+#   zero     -> very light gray
+#   positive -> amber/gold tint
+TS_NEG_RGB = (196, 181, 253)  # violet-300 (#c4b5fd)
+TS_NEU_RGB = (229, 231, 235)  # gray-100  (#f3f4f6)
+TS_POS_RGB = (253, 230, 138)  # amber-200 (#fde68a)
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def _interp_rgb(a: Tuple[int, int, int], b: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+    t = _clamp(float(t), 0.0, 1.0)
+    return (
+        int(round(a[0] + (b[0] - a[0]) * t)),
+        int(round(a[1] + (b[1] - a[1]) * t)),
+        int(round(a[2] + (b[2] - a[2]) * t)),
+    )
+
+def _rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(_clamp(rgb[0], 0, 255), _clamp(rgb[1], 0, 255), _clamp(rgb[2], 0, 255))
+
+def ts_coef_to_bg_hex(ts_coef: Optional[float], max_abs: float) -> str:
+    """
+    Map ts_coef to a background hex colour using a symmetric scale:
+      x = ts_coef / max_abs, clamped to [-1, 1]
+    Negative interpolates TS_NEG_RGB -> TS_NEU_RGB
+    Positive interpolates TS_NEU_RGB -> TS_POS_RGB
+    """
+    if ts_coef is None:
+        return _rgb_to_hex(TS_NEU_RGB)
+    try:
+        ts = float(ts_coef)
+    except Exception:
+        return _rgb_to_hex(TS_NEU_RGB)
+
+    max_abs = float(max_abs or 0.0)
+    if max_abs <= 1e-12:
+        return _rgb_to_hex(TS_NEU_RGB)
+
+    x = _clamp(ts / max_abs, -1.0, 1.0)
+    if x < 0.0:
+        t = x + 1.0
+        rgb = _interp_rgb(TS_NEG_RGB, TS_NEU_RGB, t)
+    else:
+        t = x
+        rgb = _interp_rgb(TS_NEU_RGB, TS_POS_RGB, t)
+
+    return _rgb_to_hex(rgb)
+
+def ts_legend_html(max_abs: float) -> str:
+    max_abs = float(max_abs or 0.0)
+    neg_hex = _rgb_to_hex(TS_NEG_RGB)
+    neu_hex = _rgb_to_hex(TS_NEU_RGB)
+    pos_hex = _rgb_to_hex(TS_POS_RGB)
+
+    left_label = f"{-max_abs:.6g}"
+    right_label = f"{max_abs:.6g}"
+
+    # IMPORTANT: dedent to avoid Markdown interpreting it as a code block
+    return textwrap.dedent(f"""
+    <div style="margin: 0.25rem 0 0.75rem 0;">
+      <div style="display:flex; align-items:baseline; justify-content:space-between; gap: 0.75rem;">
+        <div style="font-size: 0.86rem; color: #444;">
+          <b>T-S coefficient highlight scale</b>
+          <span style="color:#666;">(scaled to ±max |ts_coef| in this document)</span>
+        </div>
+        <div style="font-size: 0.80rem; color:#555;">
+          max |ts_coef| = <b>{max_abs:.6g}</b>
+        </div>
+      </div>
+
+      <div style="margin-top: 0.35rem;">
+        <div style="
+            height: 14px;
+            border-radius: 7px;
+            border: 1px solid rgba(0,0,0,0.14);
+            background: linear-gradient(90deg, {neg_hex} 0%, {neu_hex} 50%, {pos_hex} 100%);
+        "></div>
+
+        <div style="display:flex; justify-content:space-between; font-size: 0.74rem; color:#666; margin-top: 0.18rem;">
+          <span>{left_label}</span>
+          <span>0</span>
+          <span>{right_label}</span>
+        </div>
+
+        <div style="font-size: 0.74rem; color:#666; margin-top: 0.18rem;">
+          <span style="display:inline-block; width: 10px; height: 10px; background:{neg_hex}; border:1px solid rgba(0,0,0,0.10); border-radius:2px; margin-right:6px;"></span>
+          more negative
+          <span style="display:inline-block; width: 10px; height: 10px; background:{pos_hex}; border:1px solid rgba(0,0,0,0.10); border-radius:2px; margin:0 6px 0 14px;"></span>
+          more positive
+        </div>
+      </div>
+    </div>
+    """).strip()
+
+def highlight_text_with_debug(
+    text: str,
+    phrases_with_ids_and_docids_and_ts: List[Tuple[str, str, Optional[str], Optional[float]]],
+    ts_max_abs: float,
+) -> Tuple[str, List[Dict]]:
     clean_text = _clean_normalised_text_for_display(text)
-    if not phrases_with_ids_and_docids:
+    if not phrases_with_ids_and_docids_and_ts:
         return (html.escape(clean_text).replace("\n", "<br/>"), [])
 
-    uniq: List[Tuple[str,str,Optional[str]]] = []
+    uniq: List[Tuple[str, str, Optional[str], Optional[float]]] = []
     seen = set()
-    for item in phrases_with_ids_and_docids:
-        # each item: (phrase, fact_id, doc_id)
+    for item in phrases_with_ids_and_docids_and_ts:
         if not item or not isinstance(item, (list, tuple)) or len(item) < 2:
             continue
         phrase = item[0]
         fid = item[1]
         docid = item[2] if len(item) > 2 else None
+        ts_coef = item[3] if len(item) > 3 else None
+
         key = (phrase or "").strip()
         if not key or key in seen:
             continue
         seen.add(key)
-        uniq.append((key, fid, docid))
+        uniq.append((key, fid, docid, ts_coef))
+
     uniq.sort(key=lambda p: len(p[0]), reverse=True)
 
     raw = clean_text
-    placeholder_map: Dict[str,str] = {}
+    placeholder_map: Dict[str, str] = {}
     counter = [0]
     debug_info = []
 
-    for phrase, fid, docid in uniq:
-        info = {"phrase": phrase, "fact_id": fid, "doc_id": docid, "matched": False, "matched_substring": None, "pattern": None, "excerpt": None}
+    for phrase, fid, docid, ts_coef in uniq:
+        bg_hex = ts_coef_to_bg_hex(ts_coef, ts_max_abs)
+        try:
+            title = f"ts_coef={float(ts_coef):.6g}"
+        except Exception:
+            title = "ts_coef=0"
+
+        info = {
+            "phrase": phrase,
+            "fact_id": fid,
+            "doc_id": docid,
+            "ts_coef": float(ts_coef or 0.0),
+            "bg_hex": bg_hex,
+            "matched": False,
+            "matched_substring": None,
+            "pattern": None,
+            "excerpt": None,
+        }
+
         res = _first_matching_substring(raw, phrase)
         if res:
             matched, sidx, eidx, pattern = res
             ph = f"__HL_{counter[0]}__"
             fid_enc = urllib.parse.quote_plus(str(fid))
             doc_enc = urllib.parse.quote_plus(str(docid)) if docid else ""
-            anchor = f'<a href="?fact_id={fid_enc}&doc_id={doc_enc}" target="_self" rel="noopener noreferrer"><mark style="background:#fff59d;color:#000;font-weight:normal">{html.escape(matched)}</mark></a>'
-            # Replace only the first occurrence at sidx:eidx (careful with indices after replacements)
+
+            anchor = (
+                f'<a href="?fact_id={fid_enc}&doc_id={doc_enc}" '
+                f'target="_self" rel="noopener noreferrer" '
+                f'style="text-decoration:none;">'
+                f'<mark title="{html.escape(title)}" '
+                f'style="background:{bg_hex}; color:#000; font-weight:normal; padding: 0 2px; border-radius: 2px; '
+                f'box-shadow: inset 0 0 0 1px rgba(0,0,0,0.10);">'
+                f'{html.escape(matched)}'
+                f'</mark></a>'
+            )
+
             try:
                 raw = raw[:sidx] + ph + raw[eidx:]
             except Exception:
                 raw = raw.replace(matched, ph, 1)
+
             placeholder_map[ph] = anchor
             counter[0] += 1
-            info.update({"matched": True, "matched_substring": matched, "pattern": pattern, "excerpt": raw[max(0,sidx-80):min(len(raw), eidx+80)]})
+            info.update({"matched": True, "matched_substring": matched, "pattern": pattern, "excerpt": raw[max(0, sidx-80):min(len(raw), eidx+80)]})
         else:
             info.update({"matched": False})
+
         debug_info.append(info)
 
     esc = html.escape(raw)
@@ -277,7 +435,6 @@ initial_doc = qparams.get("doc_id", [None])[0]
 if initial_fact:
     st.session_state["selected_fact"] = initial_fact
 if initial_doc:
-    # find local file for doc_id and set selected_doc if available
     lf = find_local_file_for_doc_id(initial_doc)
     if lf:
         st.session_state["selected_doc"] = lf
@@ -318,7 +475,7 @@ with tab_files:
                     if st.button(label, key=f"file_{f.name}"):
                         st.session_state["selected_doc"] = str(f.resolve())
                         st.session_state["selected_fact"] = None
-                        st.experimental_set_query_params()  # clear query params
+                        st.experimental_set_query_params()
                     if docrow:
                         st.caption(f"doc_id: {docrow['doc_id']}  |  ticker: {docrow['ticker']}")
 
@@ -349,15 +506,40 @@ with tab_files:
             except Exception as e:
                 raw_text = f"Error reading/normalising file: {e}"
 
-            # build phrase,fact_id,doc_id tuples (docrow may be None)
+            # Pull ts_coef for all facts in this document (for colour scale)
+            fact_ids_for_doc = [c.get("fact_id") for c in claims if c.get("fact_id")]
+            ts_map = get_ts_coefs_for_fact_ids([fid for fid in fact_ids_for_doc if fid])
+
+            ts_max_abs = 0.0
+            if ts_map:
+                try:
+                    ts_max_abs = max(abs(float(v or 0.0)) for v in ts_map.values())
+                except Exception:
+                    ts_max_abs = 0.0
+
             doc_id_for_phrases = docrow["doc_id"] if docrow else None
-            phrases_with_ids_and_docids = [(c.get("quote",""), c.get("fact_id"), doc_id_for_phrases) for c in claims if c.get("quote")]
-            highlighted_html, debug_info = highlight_text_with_debug(raw_text, phrases_with_ids_and_docids)
+            phrases_with_ids_and_docids_and_ts = []
+            for c in claims:
+                quote = c.get("quote", "")
+                fid = c.get("fact_id")
+                if quote and fid:
+                    phrases_with_ids_and_docids_and_ts.append((quote, fid, doc_id_for_phrases, ts_map.get(fid, 0.0)))
+
+            highlighted_html, debug_info = highlight_text_with_debug(
+                raw_text,
+                phrases_with_ids_and_docids_and_ts,
+                ts_max_abs=ts_max_abs,
+            )
 
             doc_col, facts_col = st.columns([2.6, 1.4])
 
             with doc_col:
                 st.markdown("### Document text (click highlighted text to open fact)", unsafe_allow_html=True)
+
+                # Legend / key on top of this section
+                if claims:
+                    st.markdown(ts_legend_html(ts_max_abs), unsafe_allow_html=True)
+
                 if st.checkbox("Show debug: cleaned text & match report", value=False):
                     st.markdown("**CLEANED TEXT (head)**")
                     clean_text = _clean_normalised_text_for_display(raw_text)
@@ -365,6 +547,7 @@ with tab_files:
                     st.markdown("**Match report** (phrase → matched substring or failed)")
                     for info in debug_info:
                         st.write(info)
+
                 st.markdown(highlighted_html, unsafe_allow_html=True)
 
             with facts_col:
@@ -377,17 +560,47 @@ with tab_files:
                         status = c.get("status", "UNKNOWN")
                         snippet = (c.get("claim") or "")[:200]
                         is_selected = (fact_id == st.session_state.get("selected_fact"))
-                        if is_selected:
-                            st.markdown(f"<div style='background:#fff59d;padding:8px;border-radius:4px'>{html.escape('['+status+'] '+snippet)}</div>", unsafe_allow_html=True)
-                            if st.button("Deselect", key=f"deselect_{fpath.name}_{i}"):
-                                st.session_state["selected_fact"] = None
-                                st.experimental_set_query_params()
-                        else:
-                            if st.button(f"[{status}] {snippet}", key=f"claim_btn_{fpath.name}_{i}"):
-                                st.session_state["selected_fact"] = fact_id
-                                st.session_state["selected_doc"] = str(fpath.resolve())
-                                st.experimental_set_query_params(fact_id=fact_id, doc_id=docrow["doc_id"] if docrow else "")
-                        st.caption(f"p_true={c.get('p_true_used',0.0):.2f}  delta_aw={c.get('delta_awareness',0.0):.3f}  sim={c.get('best_match_similarity',0.0):.2f}")
+
+                        ts_val = ts_map.get(fact_id, 0.0) if fact_id else 0.0
+                        swatch_hex = ts_coef_to_bg_hex(ts_val, ts_max_abs)
+
+                        # Row: [swatch] [button]
+                        sw_col, btn_col = st.columns([0.12, 0.88], gap="small")
+                        with sw_col:
+                            st.markdown(
+                                f"<div style='margin-top: 0.55rem;'>"
+                                f"<span title='ts_coef={ts_val:.6g}' "
+                                f"style='display:inline-block;width:12px;height:12px;"
+                                f"background:{swatch_hex};border:1px solid rgba(0,0,0,0.12);"
+                                f"border-radius:3px;'></span>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        with btn_col:
+                            if is_selected:
+                                st.markdown(
+                                    f"<div style='background:#fff59d;padding:8px;border-radius:4px'>"
+                                    f"{html.escape('['+status+'] '+snippet)}"
+                                    f"</div>",
+                                    unsafe_allow_html=True
+                                )
+                                if st.button("Deselect", key=f"deselect_{fpath.name}_{i}"):
+                                    st.session_state["selected_fact"] = None
+                                    st.experimental_set_query_params()
+                            else:
+                                # Plain string label (NO HTML)
+                                if st.button(f"[{status}] {snippet}", key=f"claim_btn_{fpath.name}_{i}"):
+                                    st.session_state["selected_fact"] = fact_id
+                                    st.session_state["selected_doc"] = str(fpath.resolve())
+                                    st.experimental_set_query_params(fact_id=fact_id, doc_id=docrow["doc_id"] if docrow else "")
+
+                        st.caption(
+                            f"ts_coef={ts_val:.6g}  "
+                            f"p_true={c.get('p_true_used',0.0):.2f}  "
+                            f"delta_aw={c.get('delta_awareness',0.0):.3f}  "
+                            f"sim={c.get('best_match_similarity',0.0):.2f}"
+                        )
 
     # RIGHT details
     with right:

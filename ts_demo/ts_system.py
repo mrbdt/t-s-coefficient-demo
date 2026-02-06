@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 import re
+import math
 
 import numpy as np
 import pdfplumber
@@ -753,6 +754,74 @@ def compute_ts_coef(sign: int, materiality: float, novelty: float, surprise: flo
     """
     return float(sign) * float(materiality) * float(novelty) * float(surprise)
 
+def compute_ts_coef_enhanced(
+    sign: int,
+    materiality: float,
+    novelty: float,
+    surprise: float,
+    credibility: float,
+    p_true: float,
+    horizon: Dict[str, float],
+    issued_at_iso: Optional[str],
+    source_type: Optional[str],
+) -> float:
+    """
+    Enhanced, pragmatic computation of ts_coef (signed).
+
+    Formula (v1):
+      ts_coef = sign * p_true * materiality * novelty * credibility * surprise * reach * near_term_weight * time_decay
+
+    - sign: +1 / -1 / 0
+    - p_true: probability used at issue (already adjusted by pragmatics & source reliability)
+    - materiality, novelty, credibility, surprise : in [0,1]
+    - reach: estimated audience reach for source_type (uses SOURCE_REACH fallback)
+    - near_term_weight: weighted importance across horizons using NEAR_WEIGHTS
+    - time_decay: exponential decay by age (TAU_RELIABILITY_DAYS)
+    """
+    try:
+        sign = int(sign)
+    except Exception:
+        sign = 0
+
+    # clamp inputs
+    materiality = float(max(0.0, min(1.0, materiality or 0.0)))
+    novelty = float(max(0.0, min(1.0, novelty or 0.0)))
+    surprise = float(max(0.0, min(1.0, surprise or 0.0)))
+    credibility = float(max(0.0, min(1.0, credibility or 0.0)))
+    p_true = float(max(0.0, min(1.0, p_true or 0.5)))
+
+    # reach estimate
+    reach = float(SOURCE_REACH.get((source_type or "").upper(), 0.5))
+
+    # near-term weight from horizon distribution
+    near_term_weight = 0.0
+    try:
+        for b in HORIZON_BUCKETS:
+            near_term_weight += float(horizon.get(b, 0.0)) * float(NEAR_WEIGHTS.get(b, 0.0))
+    except Exception:
+        near_term_weight = 0.5
+    if near_term_weight <= 0.0:
+        near_term_weight = 0.5
+
+    # age / time decay
+    age_days = 0.0
+    if issued_at_iso:
+        try:
+            # issued_at_iso is an ISO timestamp string like timestamp.isoformat()
+            issued_dt = dt.datetime.fromisoformat(issued_at_iso)
+            age_days = max(0.0, (utc_now().replace(tzinfo=None) - issued_dt).days)
+        except Exception:
+            age_days = 0.0
+    time_decay = float(math.exp(-age_days / max(1.0, TAU_RELIABILITY_DAYS)))
+
+    magnitude = p_true * materiality * novelty * credibility * surprise * reach * near_term_weight * time_decay
+
+    ts_coef = float(sign) * float(magnitude)
+
+    # suppress sub-floating noise
+    if abs(ts_coef) < 1e-12:
+        return 0.0
+    return float(ts_coef)
 
 def awareness(conn: sqlite3.Connection, fact_id: str, as_of: dt.datetime, lam: float = LAMBDA_DECAY) -> float:
     cur = conn.execute("SELECT reach, timestamp FROM exposures WHERE fact_id = ?", (fact_id,))
@@ -983,13 +1052,23 @@ def extract_claims_from_chunk(
         "Extract ONLY price-relevant, atomic claims.\n"
         "Ignore boilerplate and generic risk language unless it is clearly new/changed.\n"
         "Each claim must be standalone and specific; include key numbers AND period when present.\n"
-        "Provide pragmatics fields:\n"
-        "- is_forward_looking (future expectations/intentions/guidance)\n"
-        "- modality (ASSERTION/FORECAST/INTENTION/CONDITIONAL/RISK/OPINION)\n"
-        "- commitment_0_1 (\"will\" > \"expect\" > \"could\")\n"
-        "- conditionality_0_1 (\"subject to\"/\"if\" increases)\n"
-        "- evidential_basis\n"
-        "- speaker_role (COMPANY_OFFICIAL for SEC; otherwise MANAGEMENT/ANALYST/OTHER based on quote)\n"
+        "\n"
+        "For EACH claim, output the following fields:\n"
+        "- claim (string)\n"
+        "- polarity (one of: BULLISH, BEARISH, MIXED, NEUTRAL)\n"
+        "- materiality_0_1 (0..1)\n"
+        "- credibility_0_1 (0..1)\n"
+        "- surprise_0_1 (0..1)\n"
+        "- horizon_profile (object with keys: 1D, 1W, 1M, 3M, 1Y, 3Y; values sum to ~1)\n"
+        "- rationale (string)\n"
+        "- quote (string; exact supporting snippet)\n"
+        "- is_forward_looking (boolean)\n"
+        "- modality (one of: ASSERTION, FORECAST, INTENTION, CONDITIONAL, RISK, OPINION)\n"
+        "- commitment_0_1 (0..1; \"will\" > \"expect\" > \"could\")\n"
+        "- conditionality_0_1 (0..1; \"subject to\"/\"if\" increases)\n"
+        "- evidential_basis (one of: REPORTED_NUMBER, OPERATIONAL_OBSERVATION, INTERNAL_METRIC, UNSPECIFIED)\n"
+        "- speaker_role (one of: COMPANY_OFFICIAL, MANAGEMENT, ANALYST, OTHER; COMPANY_OFFICIAL for SEC)\n"
+        "\n"
         "Return between 0 and 8 claims. If nothing material, return an empty list."
     )
 
@@ -1023,7 +1102,7 @@ def extract_claims_from_chunk(
         resp = client.responses.create(
             model=OPENAI_MODEL,
             input=[
-                {"role": "system", "content": instructions + "\nReturn ONLY valid JSON with top-level key 'claims'."},
+                {"role": "system", "content": instructions + "\nReturn ONLY valid JSON matching: {\"claims\": [ ... ]}. Do not include any extra keys outside 'claims'."},
                 {"role": "user", "content": user},
             ],
             text={"format": {"type": "json_object"}},
@@ -1245,7 +1324,26 @@ def ingest_document(
 
         if not same_fact:
             fact_id = f"fact_{ticker}_{hashlib.sha256(c.claim.encode('utf-8')).hexdigest()[:16]}"
-            ts_coef = compute_ts_coef(sign, c.materiality_0_1, novelty, c.surprise_0_1)
+
+            # Compute an enhanced, signed ts_coef that uses pragmatic p_true and horizon/time weighting.
+            # We use p_true_new (already adjusted for pragmatics & source reliability) as the probability at issue.
+            try:
+                ts_coef = compute_ts_coef_enhanced(
+                    sign=int(sign),
+                    materiality=float(c.materiality_0_1),
+                    novelty=float(novelty),
+                    surprise=float(c.surprise_0_1),
+                    credibility=float(c.credibility_0_1),
+                    p_true=float(p_true_new),            # p_true_new computed earlier in this function
+                    horizon=horizon,
+                    issued_at_iso=timestamp.isoformat(),
+                    source_type=source_type,
+                )
+            except Exception as _e:
+                # Fallback to legacy simple coefficient if something unexpected happens
+                ts_coef = compute_ts_coef(sign, c.materiality_0_1, novelty, c.surprise_0_1)
+
+            
 
             now = utc_now().isoformat()
             conn.execute(
