@@ -6,6 +6,8 @@ How to use:
 Activate the venv (if not already) (do so within the ts_demo folder):
     source .venv/bin/activate
 
+If not yet present, create a .env file for environment parameters. see .env.example for fields that needs to be filled in.
+
 (optional) Re-create a clean DB, clear the inputs folder, clear the evaluation output (for a clear demo):
     rm -f ts_kb_GOOGL_demo.sqlite3
 
