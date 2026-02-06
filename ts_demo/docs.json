@@ -18,5 +18,55 @@
     "source_type": "EARNINGS_CALL",
     "timestamp": "2025-04-24T20:30:00+00:00",
     "authority": 0.95
+  },
+  {
+    "name": "GOOGL_2025_Q1_10Q",
+    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000043/goog-20250331.htm",
+    "suffix": ".html",
+    "ticker": "GOOGL",
+    "doc_type": "10-Q",
+    "source_type": "SEC_FILING",
+    "timestamp": "2025-04-25T00:00:00+00:00",
+    "authority": 1.0
+  },
+  {
+    "name": "GOOGL_Q2_2025_EARNINGS_CALL",
+    "url": "https://s206.q4cdn.com/479360582/files/doc_financials/2025/q2/2025-q2-earnings-transcript.pdf",
+    "suffix": ".pdf",
+    "ticker": "GOOGL",
+    "doc_type": "EARNINGS_CALL_TRANSCRIPT",
+    "source_type": "EARNINGS_CALL",
+    "timestamp": "2025-07-23T20:30:00+00:00",
+    "authority": 0.95
+  },
+  {
+    "name": "GOOGL_2025_Q2_10Q",
+    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000062/goog-20250630.htm",
+    "suffix": ".html",
+    "ticker": "GOOGL",
+    "doc_type": "10-Q",
+    "source_type": "SEC_FILING",
+    "timestamp": "2025-07-24T00:00:00+00:00",
+    "authority": 1.0
+  },
+  {
+    "name": "GOOGL_Q3_2025_EARNINGS_CALL",
+    "url": "https://s206.q4cdn.com/479360582/files/doc_events/2025/Oct/29/2025_Q3_Earnings_Transcript.pdf",
+    "suffix": ".pdf",
+    "ticker": "GOOGL",
+    "doc_type": "EARNINGS_CALL_TRANSCRIPT",
+    "source_type": "EARNINGS_CALL",
+    "timestamp": "2025-10-29T21:30:00+00:00",
+    "authority": 0.95
+  },
+  {
+    "name": "GOOGL_2025_Q3_10Q",
+    "url": "https://www.sec.gov/Archives/edgar/data/1652044/000165204425000091/goog-20250930.htm",
+    "suffix": ".html",
+    "ticker": "GOOGL",
+    "doc_type": "10-Q",
+    "source_type": "SEC_FILING",
+    "timestamp": "2025-10-30T00:00:00+00:00",
+    "authority": 1.0
   }
 ]
