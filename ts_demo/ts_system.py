@@ -1327,279 +1327,29 @@ def ingest_document(
     url: Optional[str] = None,
     as_of: Optional[dt.datetime] = None,
 ) -> IngestResult:
-    """Ingest a single source document and update the persistent knowledge base.
+    """Ingest a single source document via the staged pipeline orchestrator."""
+    from pipeline_main import ingest_document_pipeline
 
-    Pipeline stages in this function:
-    1) Register document metadata (`docs`) and normalize raw text.
-    2) Extract and within-document deduplicate candidate claims.
-    3) Match claims against existing facts (or create new facts).
-    4) Update exposure/probability state and compute impact predictions.
-    5) Persist provenance rows (`doc_claims`) and document aggregates (`doc_scores`).
-
-    `as_of` controls time-aware metrics (awareness/decay). For walk-forward simulation,
-    pass `as_of=timestamp` so the system only uses information available at that time.
-    """
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is not set (set it in .env or your shell).")
-
-    as_of = as_of or timestamp
-
-    client = OpenAI()
-    global STRUCTURED_PARSE_ENABLED
-    if STRUCTURED_PARSE_ENABLED:
-        STRUCTURED_PARSE_ENABLED = _supports_structured_parse(client)
-    conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
-
-    doc_hash = sha256_file(path)
-    doc_id = f"doc_{ticker}_{doc_hash[:12]}"
-
-    conn.execute(
-        "INSERT OR IGNORE INTO docs(doc_id,ticker,doc_type,source_type,timestamp,sha256,url) VALUES (?,?,?,?,?,?,?)",
-        (doc_id, ticker, doc_type, source_type, timestamp.isoformat(), doc_hash, url),
-    )
-    conn.commit()
-
-    text = normalise_to_text(path)
-    chunks = sample_chunks(chunk_text(text), TS_MAX_CHUNKS)
-
-    existing_facts = fetch_facts_for_ticker(conn, ticker)
-
-    # Extract
-    extracted: List[ExtractedClaim] = []
-    for i, ch in enumerate(chunks):
-        print(f"[ingest] Extracting claims from chunk {i+1}/{len(chunks)} ...")
-        extracted.extend(extract_claims_from_chunk(client, ch, ticker, doc_type, source_type))
-        # small pause to avoid tiny bursts to the LLM and keep console readable
-        import time
-        time.sleep(0.01)
-
-    # Within-doc dedup (embedding)
-    merged: List[ExtractedClaim] = []
-    seen_vecs: List[np.ndarray] = []
-    for c in extracted:
-        v = embed(client, c.claim)
-        if any(cosine(v, sv) > 0.92 for sv in seen_vecs):
-            continue
-        seen_vecs.append(v)
-        merged.append(c)
-
-    reach = float(SOURCE_REACH.get(source_type, 0.50))
-    authority = float(np.clip(authority, 0.0, 1.0))
-
-    pred_by_horizon = {b: 0.0 for b in HORIZON_BUCKETS}
-    near_term_total = 0.0
-
-    # For UI ranking
-    claim_rows: List[Dict[str, Any]] = []
-
-    n_new = n_known = n_reconfirmed = 0
-
-    for c in merged:
-        claim_vec = embed(client, c.claim)
-        novelty, matched_id, best_sim = novelty_against_kb(c.claim, claim_vec, existing_facts)
-
-        # Fuzzy similarity for same-fact decision
-        fuzz_sim = 0.0
-        if matched_id is not None:
-            best_text = next(x["canonical_text"] for x in existing_facts if x["fact_id"] == matched_id)
-            fuzz_sim = fuzz.token_set_ratio(c.claim, best_text) / 100.0
-
-        same_fact = matched_id is not None and treat_as_same_fact(embed_sim=best_sim, fuzz_sim=fuzz_sim)
-
-        sign = polarity_to_sign(c.polarity)
-        horizon = normalise_horizon(c.horizon_profile)
-
-        # Source reliability and pragmatics
-        source_id = f"{ticker}:{c.speaker_role}"
-        rel = get_source_reliability(conn, source_id)
-        p0 = float(np.clip(c.credibility_0_1, 0.0, 1.0))
-        p_prag = pragmatics_adjust(p0, c.commitment_0_1, c.conditionality_0_1, c.is_forward_looking)
-        p_true_new = apply_reliability(p_prag, rel)
-
-        if not same_fact:
-            fact_id = f"fact_{ticker}_{hashlib.sha256(c.claim.encode('utf-8')).hexdigest()[:16]}"
-
-            # Compute an enhanced, signed ts_coef that uses pragmatic p_true and horizon/time weighting.
-            # We use p_true_new (already adjusted for pragmatics & source reliability) as the probability at issue.
-            try:
-                ts_coef = compute_ts_coef_enhanced(
-                    sign=int(sign),
-                    materiality=float(c.materiality_0_1),
-                    novelty=float(novelty),
-                    surprise=float(c.surprise_0_1),
-                    credibility=float(c.credibility_0_1),
-                    p_true=float(p_true_new),            # p_true_new computed earlier in this function
-                    horizon=horizon,
-                    issued_at_iso=timestamp.isoformat(),
-                    source_type=source_type,
-                )
-            except Exception as _e:
-                # Fallback to legacy simple coefficient if something unexpected happens
-                ts_coef = compute_ts_coef(sign, c.materiality_0_1, novelty, c.surprise_0_1)
-
-            
-
-            now = utc_now().isoformat()
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO facts(
-                    fact_id,ticker,canonical_text,embedding_json,
-                    sign,materiality,novelty,surprise,ts_coef,horizon_json,
-                    source_id,speaker_role,
-                    is_forward_looking,modality,commitment,conditionality,evidential_basis,
-                    p0_cred,p_prag,p_true_latest,p_true_at_issue,
-                    issued_at,created_at,updated_at
-                )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    fact_id, ticker, c.claim, json.dumps(claim_vec.tolist()),
-                    int(sign), float(c.materiality_0_1), float(novelty), float(c.surprise_0_1), float(ts_coef), json.dumps(horizon),
-                    source_id, c.speaker_role,
-                    1 if c.is_forward_looking else 0, c.modality, float(c.commitment_0_1), float(c.conditionality_0_1), c.evidential_basis,
-                    float(p0), float(p_prag), float(p_true_new), float(p_true_new),
-                    timestamp.isoformat(), now, now
-                ),
-            )
-            conn.commit()
-
-            existing_facts.append({
-                "fact_id": fact_id,
-                "canonical_text": c.claim,
-                "embedding": claim_vec,
-                "ts_coef": float(ts_coef),
-            })
-
-            status = "NEW"
-        else:
-            fact_id = matched_id  # type: ignore[assignment]
-            cur = conn.execute("SELECT ts_coef, horizon_json, p_true_latest, issued_at FROM facts WHERE fact_id = ?", (fact_id,))
-            ts_coef_db, horizon_json_db, p_true_latest_db, issued_at_db = cur.fetchone()
-            ts_coef = float(ts_coef_db)
-            horizon = json.loads(horizon_json_db)
-
-            # incorporate new evidence monotonically
-            p_true_latest = combine_independent_evidence(float(p_true_latest_db), p_true_new, authority)
-            conn.execute(
-                "UPDATE facts SET p_true_latest=?, updated_at=? WHERE fact_id=?",
-                (float(p_true_latest), utc_now().isoformat(), fact_id),
-            )
-            conn.commit()
-
-            status = status_from_similarity(best_sim)
-
-        if status == "NEW":
-            n_new += 1
-        elif status == "KNOWN":
-            n_known += 1
-        else:
-            n_reconfirmed += 1
-
-        # Delta-awareness at event time
-        aw_before = awareness(conn, fact_id, as_of)
-        exposure_id = f"exp_{fact_id}_{doc_id}"
-        conn.execute(
-            "INSERT OR IGNORE INTO exposures(exposure_id,fact_id,doc_id,source_type,reach,authority,timestamp) VALUES (?,?,?,?,?,?,?)",
-            (exposure_id, fact_id, doc_id, source_type, reach, authority, timestamp.isoformat()),
-        )
-        conn.commit()
-        aw_after = awareness(conn, fact_id, as_of)
-        delta_aw = float(max(0.0, aw_after - aw_before))
-
-        # Probability used for this event
-        cur = conn.execute("SELECT p_true_latest, issued_at FROM facts WHERE fact_id = ?", (fact_id,))
-        p_true_used, issued_at = cur.fetchone()
-        p_true_used = float(p_true_used)
-
-        # Per-horizon prediction contribution
-        pred_h = {b: float(ts_coef * p_true_used * delta_aw * float(horizon[b])) for b in HORIZON_BUCKETS}
-        pred_total = float(sum(pred_h.values()))
-
-        for b in HORIZON_BUCKETS:
-            pred_by_horizon[b] += pred_h[b]
-        near_term_total += float(sum(pred_h[b] * NEAR_WEIGHTS[b] for b in HORIZON_BUCKETS))
-
-        # For ranking in UI
-        age_days = max(0.0, (as_of - dt.datetime.fromisoformat(issued_at)).total_seconds() / 86400.0)
-        aw_now = aw_after
-        impact_rank = impact_now(ts_coef, p_true_used, horizon, age_days, aw_now)
-
-        doc_claim_id = f"dc_{doc_id}_{fact_id}_{hashlib.sha256(c.claim.encode('utf-8')).hexdigest()[:8]}"
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO doc_claims(
-                doc_claim_id,doc_id,fact_id,
-                extracted_claim,quote,rationale,polarity,
-                best_match_similarity,status,
-                delta_awareness,p_true_used,pred_horizon_json,pred_total
-            )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                doc_claim_id, doc_id, fact_id,
-                c.claim, c.quote, c.rationale, c.polarity,
-                float(best_sim), status,
-                float(delta_aw), float(p_true_used), json.dumps(pred_h), float(pred_total)
-            ),
-        )
-        conn.commit()
-
-        claim_rows.append({
-            "fact_id": fact_id,
-            "status": status,
-            "best_match_similarity": float(best_sim),
-            "delta_awareness": float(delta_aw),
-            "ts_coef": float(ts_coef),
-            "p_true": float(p_true_used),
-            "impact_rank": float(impact_rank),
-            "pred_total": float(pred_total),
-            "pred_horizon": pred_h,
-            "claim": c.claim,
-            "quote": c.quote,
-            "rationale": c.rationale,
-            "pragmatics": {
-                "is_forward_looking": bool(c.is_forward_looking),
-                "modality": c.modality,
-                "commitment_0_1": float(c.commitment_0_1),
-                "conditionality_0_1": float(c.conditionality_0_1),
-                "evidential_basis": c.evidential_basis,
-                "speaker_role": c.speaker_role,
-            }
-        })
-
-    # Document-level score row
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO doc_scores(
-            doc_id,ticker,timestamp,
-            pred_horizon_json,pred_near_term,
-            n_claims,n_new,n_known,n_reconfirmed
-        )
-        VALUES (?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            doc_id, ticker, timestamp.isoformat(),
-            json.dumps(pred_by_horizon),
-            float(near_term_total),
-            int(len(claim_rows)), int(n_new), int(n_known), int(n_reconfirmed)
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    # Return top claims by impact_rank for showmanship
-    claim_rows.sort(key=lambda x: abs(x["impact_rank"]), reverse=True)
-    return IngestResult(
-        doc_id=doc_id,
+    result = ingest_document_pipeline(
+        path=path,
         ticker=ticker,
         doc_type=doc_type,
         source_type=source_type,
-        timestamp=timestamp.isoformat(),
-        n_claims=len(claim_rows),
-        pred_by_horizon=pred_by_horizon,
-        pred_near_term=float(near_term_total),
-        top_claims=claim_rows[:15],
+        timestamp=timestamp,
+        authority=authority,
+        url=url,
+        as_of=as_of,
+    )
+    return IngestResult(
+        doc_id=result.doc_id,
+        ticker=result.ticker,
+        doc_type=result.doc_type,
+        source_type=result.source_type,
+        timestamp=result.timestamp,
+        n_claims=result.n_claims,
+        pred_by_horizon=result.pred_by_horizon,
+        pred_near_term=result.pred_near_term,
+        top_claims=result.top_claims,
     )
 
 
