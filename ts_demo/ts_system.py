@@ -1,3 +1,19 @@
+"""
+Core pipeline for the T-S coefficient demo.
+
+High-level flow implemented in this module:
+1) Normalize raw documents (HTML/PDF/DOCX) into plain analysis text.
+2) Ask an LLM to extract atomic valuation-relevant claims.
+3) Deduplicate claims against existing facts using embeddings + fuzzy matching.
+4) Update fact-level probabilities/reliability and compute impact scores.
+5) Persist provenance so analysts can audit every score back to source text.
+
+Most functions below are designed to be individually readable and testable:
+- pure scoring/probability helpers (math-only)
+- storage helpers (SQL writes/reads)
+- orchestration helpers (chunking, extraction, ingestion)
+"""
+
 from __future__ import annotations
 
 import datetime as dt
@@ -163,6 +179,13 @@ def table_to_markdown_from_list(table: List[List[str]]) -> str:
 
 
 def normalise_to_text(path: Path | str) -> str:
+    """Convert heterogeneous source files into analysis-friendly text.
+
+    Design goals:
+    - Preserve economically relevant content (including tables and inline XBRL facts).
+    - Remove markup noise that hurts extraction quality.
+    - Return a single plain-text representation regardless of input format.
+    """
     path = Path(path)
     ext = path.suffix.lower()
 
@@ -316,6 +339,11 @@ def normalise_to_text(path: Path | str) -> str:
 
 
 def chunk_text(text: str, max_chars: int = 7000, overlap: int = 700) -> List[str]:
+    """Split long text into overlapping windows for LLM extraction.
+
+    Overlap is intentional: claims near boundaries should still appear fully in at
+    least one chunk so we do not lose context-sensitive statements.
+    """
     text = text.strip()
     if not text:
         return []
@@ -331,6 +359,10 @@ def chunk_text(text: str, max_chars: int = 7000, overlap: int = 700) -> List[str
 
 
 def sample_chunks(chunks: List[str], k: int) -> List[str]:
+    """Subsample chunks when documents are huge to cap extraction cost.
+
+    Heuristic keeps early, middle, and late sections to preserve narrative coverage.
+    """
     if len(chunks) <= k:
         return chunks
     # start / middle / end sampling
@@ -346,6 +378,7 @@ def sample_chunks(chunks: List[str], k: int) -> List[str]:
 # DB schema
 # -----------------------------
 def init_db(conn: sqlite3.Connection) -> None:
+    """Create all required tables and indexes for the demo knowledge base."""
     conn.execute("""
     CREATE TABLE IF NOT EXISTS facts (
         fact_id TEXT PRIMARY KEY,
@@ -595,8 +628,11 @@ def _normalize_speaker_role(v: Optional[str]) -> str:
 
 
 def parse_raw_claims(data: dict, chunk: str) -> List[ExtractedClaim]:
-    """
-    Defensive mapping from arbitrary JSON returned by the model into our ExtractedClaim Pydantic objects.
+    """Defensively coerce loosely-structured model JSON into `ExtractedClaim` objects.
+
+    This parser exists because model outputs can drift. Instead of failing hard, we
+    normalize fields, clamp ranges, and provide sensible defaults so ingestion can
+    proceed while still producing auditable records.
     """
     out: List[ExtractedClaim] = []
     if not isinstance(data, dict):
