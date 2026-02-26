@@ -1,3 +1,19 @@
+"""
+Core pipeline for the T-S coefficient demo.
+
+High-level flow implemented in this module:
+1) Normalize raw documents (HTML/PDF/DOCX) into plain analysis text.
+2) Ask an LLM to extract atomic valuation-relevant claims.
+3) Deduplicate claims against existing facts using embeddings + fuzzy matching.
+4) Update fact-level probabilities/reliability and compute impact scores.
+5) Persist provenance so analysts can audit every score back to source text.
+
+Most functions below are designed to be individually readable and testable:
+- pure scoring/probability helpers (math-only)
+- storage helpers (SQL writes/reads)
+- orchestration helpers (chunking, extraction, ingestion)
+"""
+
 from __future__ import annotations
 
 import datetime as dt
@@ -63,6 +79,17 @@ FUZZ_SAME_STRICT = 0.92
 
 # Status labels for demo readability
 def status_from_similarity(sim: float) -> str:
+    """Map a numeric similarity score to a human-readable lifecycle label.
+
+    Why this helper exists:
+    - Analysts prefer categorical tags (NEW/KNOWN/RECONFIRMED) over raw cosine values.
+    - The thresholds are intentionally simple, deterministic, and easy to tune.
+
+    Threshold semantics:
+    - >= 0.95  -> RECONFIRMED: nearly identical claim seen again.
+    - >= 0.65  -> KNOWN: substantially overlaps an existing fact.
+    - <  0.65  -> NEW: treated as a new fact candidate.
+    """
     if sim >= 0.95:
         return "RECONFIRMED"
     if sim >= 0.65:
@@ -105,8 +132,10 @@ class ExtractedClaims(BaseModel):
 # Text normalisation
 # -----------------------------
 def table_to_markdown_from_bs4(table_tag) -> str:
-    """
-    Convert a BeautifulSoup <table> tag to markdown.
+    """Convert an HTML table (`bs4` tag) into markdown text.
+
+    This makes tabular financial data visible to LLM extraction in plain text form
+    without requiring HTML understanding at inference time.
     """
     rows = []
     for tr in table_tag.find_all("tr"):
@@ -141,8 +170,10 @@ def table_to_markdown_from_bs4(table_tag) -> str:
 
 
 def table_to_markdown_from_list(table: List[List[str]]) -> str:
-    """
-    Convert a table represented as a list-of-lists (pdfplumber) into markdown.
+    """Convert a `pdfplumber` list-of-lists table into markdown text.
+
+    PDF extraction often yields ragged rows (different column counts by row).
+    We pad rows to a consistent width so downstream consumers get stable structure.
     """
     if not table:
         return ""
@@ -163,6 +194,13 @@ def table_to_markdown_from_list(table: List[List[str]]) -> str:
 
 
 def normalise_to_text(path: Path | str) -> str:
+    """Convert heterogeneous source files into analysis-friendly text.
+
+    Design goals:
+    - Preserve economically relevant content (including tables and inline XBRL facts).
+    - Remove markup noise that hurts extraction quality.
+    - Return a single plain-text representation regardless of input format.
+    """
     path = Path(path)
     ext = path.suffix.lower()
 
@@ -316,6 +354,11 @@ def normalise_to_text(path: Path | str) -> str:
 
 
 def chunk_text(text: str, max_chars: int = 7000, overlap: int = 700) -> List[str]:
+    """Split long text into overlapping windows for LLM extraction.
+
+    Overlap is intentional: claims near boundaries should still appear fully in at
+    least one chunk so we do not lose context-sensitive statements.
+    """
     text = text.strip()
     if not text:
         return []
@@ -331,6 +374,10 @@ def chunk_text(text: str, max_chars: int = 7000, overlap: int = 700) -> List[str
 
 
 def sample_chunks(chunks: List[str], k: int) -> List[str]:
+    """Subsample chunks when documents are huge to cap extraction cost.
+
+    Heuristic keeps early, middle, and late sections to preserve narrative coverage.
+    """
     if len(chunks) <= k:
         return chunks
     # start / middle / end sampling
@@ -346,6 +393,7 @@ def sample_chunks(chunks: List[str], k: int) -> List[str]:
 # DB schema
 # -----------------------------
 def init_db(conn: sqlite3.Connection) -> None:
+    """Create all required tables and indexes for the demo knowledge base."""
     conn.execute("""
     CREATE TABLE IF NOT EXISTS facts (
         fact_id TEXT PRIMARY KEY,
@@ -483,6 +531,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 # Utilities
 # -----------------------------
 def sha256_file(path: Path) -> str:
+    """Compute a stable SHA-256 fingerprint for file identity and deduping."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
@@ -494,10 +543,12 @@ def sha256_file(path: Path) -> str:
 
 
 def utc_now() -> dt.datetime:
+    """Return timezone-aware UTC now (avoids naive datetime bugs)."""
     return dt.datetime.now(dt.timezone.utc)
 
 
 def polarity_to_sign(p: Polarity) -> int:
+    """Convert categorical polarity into numeric sign used by scoring math."""
     if p == "BULLISH":
         return +1
     if p == "BEARISH":
@@ -506,6 +557,13 @@ def polarity_to_sign(p: Polarity) -> int:
 
 
 def normalise_horizon(h: Dict[str, float]) -> Dict[str, float]:
+    """Normalize horizon weights to a proper probability distribution.
+
+    Guarantees:
+    - All required buckets exist.
+    - Values sum to ~1.0.
+    - Falls back to a reasonable default profile if input is empty/invalid.
+    """
     out = {k: float(h.get(k, 0.0)) for k in HORIZON_BUCKETS}
     s = float(sum(out.values()))
     if s <= 0:
@@ -515,6 +573,7 @@ def normalise_horizon(h: Dict[str, float]) -> Dict[str, float]:
 
 
 def embed(client: OpenAI, text: str) -> np.ndarray:
+    """Create a unit-normalized embedding vector for similarity comparisons."""
     resp = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=text, encoding_format="float")
     vec = np.array(resp.data[0].embedding, dtype=np.float32)
     n = float(np.linalg.norm(vec) + 1e-12)
@@ -545,6 +604,11 @@ def _supports_structured_parse(client: OpenAI) -> bool:
 
 
 def _safe_json_load(raw: str) -> dict:
+    """Best-effort JSON parser for imperfect model outputs.
+
+    We first try strict JSON, then attempt to recover the first JSON object-shaped
+    substring. If both fail, we return an empty claims payload rather than crashing.
+    """
     try:
         return json.loads(raw)
     except Exception:
@@ -595,8 +659,11 @@ def _normalize_speaker_role(v: Optional[str]) -> str:
 
 
 def parse_raw_claims(data: dict, chunk: str) -> List[ExtractedClaim]:
-    """
-    Defensive mapping from arbitrary JSON returned by the model into our ExtractedClaim Pydantic objects.
+    """Defensively coerce loosely-structured model JSON into `ExtractedClaim` objects.
+
+    This parser exists because model outputs can drift. Instead of failing hard, we
+    normalize fields, clamp ranges, and provide sensible defaults so ingestion can
+    proceed while still producing auditable records.
     """
     out: List[ExtractedClaim] = []
     if not isinstance(data, dict):
@@ -693,10 +760,12 @@ def parse_raw_claims(data: dict, chunk: str) -> List[ExtractedClaim]:
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    """Cosine similarity for pre-normalized vectors (dot product shortcut)."""
     return float(np.dot(a, b))
 
 
 def get_source_reliability(conn: sqlite3.Connection, source_id: str) -> float:
+    """Fetch source reliability prior; initialize to 1.0 if unseen."""
     cur = conn.execute("SELECT reliability FROM sources WHERE source_id = ?", (source_id,))
     row = cur.fetchone()
     if row is None:
@@ -749,8 +818,10 @@ def combine_independent_evidence(p_old: float, p_new: float, authority: float) -
 
 
 def compute_ts_coef(sign: int, materiality: float, novelty: float, surprise: float) -> float:
-    """
-    TS_coef is fixed: "impact if true and widely believed".
+    """Baseline T-S coefficient (legacy/simple formula).
+
+    Interpreted as directional impact magnitude under the counterfactual where the
+    claim is true and broadly diffused in the market.
     """
     return float(sign) * float(materiality) * float(novelty) * float(surprise)
 
@@ -852,6 +923,7 @@ def impact_now(ts_coef: float, p_true: float, horizon: Dict[str, float], age_day
 
 
 def fetch_facts_for_ticker(conn: sqlite3.Connection, ticker: str) -> List[Dict[str, Any]]:
+    """Load existing canonical facts for dedupe against new extracted claims."""
     cur = conn.execute(
         "SELECT fact_id, canonical_text, embedding_json, ts_coef FROM facts WHERE ticker = ?",
         (ticker,),
@@ -868,6 +940,11 @@ def fetch_facts_for_ticker(conn: sqlite3.Connection, ticker: str) -> List[Dict[s
 
 
 def novelty_against_kb(claim_text: str, claim_vec: np.ndarray, existing: List[Dict[str, Any]]) -> Tuple[float, Optional[str], float]:
+    """Compute novelty vs. knowledge base and return best candidate match.
+
+    Returns `(novelty, best_fact_id, best_similarity)` where novelty is `1-sim`.
+    Similarity blends embedding proximity with fuzzy token overlap for robustness.
+    """
     best_sim = 0.0
     best_id: Optional[str] = None
     best_text = None
@@ -888,6 +965,7 @@ def novelty_against_kb(claim_text: str, claim_vec: np.ndarray, existing: List[Di
 
 
 def treat_as_same_fact(embed_sim: float, fuzz_sim: float) -> bool:
+    """Decision rule for whether a new claim should merge into an existing fact."""
     return (embed_sim >= EMBED_SAME_STRICT) or (embed_sim >= EMBED_SAME_LOOSE and fuzz_sim >= FUZZ_SAME_STRICT)
 
 
@@ -1044,8 +1122,14 @@ def extract_claims_from_chunk(
     source_type: str,
     max_split_depth: int = 2
 ) -> List[ExtractedClaim]:
-    """
-    Extract claims from a chunk. Non-destructive approach.
+    """Extract valuation-relevant atomic claims from a text chunk.
+
+    Strategy:
+    1) Prefer structured parsing into `ExtractedClaims` for schema safety.
+    2) If unavailable/failing, fallback to JSON mode and coerce via `parse_raw_claims`.
+    3) If chunk is still too noisy/long, caller may recursively split and retry.
+
+    This function intentionally never mutates KB state; it only returns parsed claims.
     """
     instructions = (
         "You are an expert equity research analyst.\n"
@@ -1134,9 +1218,12 @@ def extract_claims_from_chunk(
 # Reliability update (recency-weighted Brier)
 # -----------------------------
 def recalc_source_reliability(conn: sqlite3.Connection, source_id: str) -> float:
-    """
-    Reliability = 1 - min(1, Brier/0.25), with exponential recency weighting.
-    Uses p_pred_at_issue stored at resolution time.
+    """Recompute a source reliability score from historical resolutions.
+
+    Formula details:
+    - Compute recency-weighted Brier error over `(p_pred_at_issue, outcome)` pairs.
+    - Convert Brier -> reliability via `1 - min(1, Brier/0.25)` so range is [0, 1].
+    - Persist the updated reliability in `sources` for future ingest runs.
     """
     cur = conn.execute(
         "SELECT resolved_at, outcome, p_pred_at_issue FROM resolutions WHERE source_id = ?",
@@ -1177,8 +1264,11 @@ def resolve_fact(
     evidence: str,
     method: str = "MANUAL",
 ) -> None:
-    """
-    Record a resolution and update the relevant source reliability.
+    """Record a fact resolution and trigger reliability recalibration.
+
+    Intended usage:
+    - Called by analysts (manual adjudication) or automated evaluators.
+    - Writes an immutable resolution event, then updates source reliability priors.
     """
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
@@ -1237,12 +1327,17 @@ def ingest_document(
     url: Optional[str] = None,
     as_of: Optional[dt.datetime] = None,
 ) -> IngestResult:
-    """
-    Ingest one artefact into the KB, compute:
-    - claim-level delta-awareness predictions per horizon
-    - doc-level predictions per horizon
+    """Ingest a single source document and update the persistent knowledge base.
 
-    Use as_of=timestamp for walk-forward demos.
+    Pipeline stages in this function:
+    1) Register document metadata (`docs`) and normalize raw text.
+    2) Extract and within-document deduplicate candidate claims.
+    3) Match claims against existing facts (or create new facts).
+    4) Update exposure/probability state and compute impact predictions.
+    5) Persist provenance rows (`doc_claims`) and document aggregates (`doc_scores`).
+
+    `as_of` controls time-aware metrics (awareness/decay). For walk-forward simulation,
+    pass `as_of=timestamp` so the system only uses information available at that time.
     """
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not set (set it in .env or your shell).")
@@ -1512,6 +1607,7 @@ def ingest_document(
 # Convenience queries for UI / scripts
 # -----------------------------
 def list_docs(ticker: str) -> List[Dict[str, Any]]:
+    """List ingested documents for a ticker (newest first)."""
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
     cur = conn.execute(
@@ -1539,6 +1635,7 @@ def list_docs(ticker: str) -> List[Dict[str, Any]]:
 
 
 def list_doc_claims(doc_id: str) -> List[Dict[str, Any]]:
+    """List all claim rows associated with a given document id."""
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
     cur = conn.execute(
@@ -1567,6 +1664,7 @@ def list_doc_claims(doc_id: str) -> List[Dict[str, Any]]:
 
 
 def list_unresolved_forward_looking(ticker: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Return forward-looking facts that have not yet been resolved/adjudicated."""
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
     cur = conn.execute(
@@ -1599,6 +1697,7 @@ def list_unresolved_forward_looking(ticker: str, limit: int = 50) -> List[Dict[s
 
 
 def list_sources() -> List[Dict[str, Any]]:
+    """List sources and their current reliability estimates."""
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
     cur = conn.execute("SELECT source_id, reliability, updated_at FROM sources ORDER BY source_id ASC")

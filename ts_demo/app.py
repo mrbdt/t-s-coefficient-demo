@@ -1,3 +1,16 @@
+"""
+Streamlit UI for exploring the T-S prototype knowledge base.
+
+The app is intentionally split into three analyst-facing workflows:
+1) "Files": inspect document text, see extracted claims, and open detailed provenance.
+2) "Unresolved forward-looking": find predictions that still need adjudication.
+3) "Source reliability": inspect reliability scores learned from resolutions.
+
+Most helper functions in this file are about one of two concerns:
+- Fetching well-shaped records from SQLite for display.
+- Cleaning / highlighting document text so extracted claims are easy to click and audit.
+"""
+
 # ts_demo/app.py
 import os
 import sqlite3
@@ -50,9 +63,20 @@ if not INPUT_DIR.exists():
 
 # --- DB helpers ---------------------------------------------------------
 def _get_conn():
+    """Create a short-lived SQLite connection.
+
+    We intentionally open/close connections per operation in this demo app to keep
+    state handling simple and avoid long-lived connection surprises in Streamlit.
+    """
     return sqlite3.connect(DB_PATH)
 
 def get_doc_by_sha_safe(sha: Optional[str]):
+    """Lookup document metadata by SHA-256, with graceful fallback.
+
+    Why this exists:
+    - In some environments, `ts_system.get_doc_by_sha` may not be available.
+    - We still want the app to keep working, so we fallback to a direct SQL query.
+    """
     if not sha:
         return None
     if 'get_doc_by_sha' in globals() and callable(globals()['get_doc_by_sha']):
@@ -70,6 +94,7 @@ def get_doc_by_sha_safe(sha: Optional[str]):
     return dict(zip(keys, row))
 
 def get_doc_by_id(doc_id: str):
+    """Fetch one row from `docs` and return it as a dict for UI use."""
     conn = _get_conn()
     cur = conn.execute("SELECT doc_id,ticker,doc_type,source_type,timestamp,sha256,url FROM docs WHERE doc_id = ?", (doc_id,))
     row = cur.fetchone()
@@ -80,6 +105,7 @@ def get_doc_by_id(doc_id: str):
     return dict(zip(keys, row))
 
 def get_fact_overview(fact_id: str):
+    """Fetch the main fact record shown in the right-side detail panel."""
     conn = _get_conn()
     cur = conn.execute(
         "SELECT fact_id, canonical_text, ts_coef, p_true_latest, p_true_at_issue, issued_at, source_id, speaker_role, is_forward_looking, modality, commitment, conditionality, evidential_basis "
@@ -94,6 +120,7 @@ def get_fact_overview(fact_id: str):
     return dict(zip(keys,row))
 
 def get_fact_occurrences(fact_id: str):
+    """Return every document occurrence for a fact, ordered chronologically."""
     conn = _get_conn()
     cur = conn.execute(
         "SELECT d.doc_id, d.timestamp, d.doc_type, d.source_type, dc.status, dc.best_match_similarity, dc.delta_awareness, dc.pred_total "
@@ -117,6 +144,7 @@ def get_fact_occurrences(fact_id: str):
     return occs
 
 def get_fact_resolutions(fact_id: str):
+    """Return adjudication history for a fact (newest first)."""
     conn = _get_conn()
     cur = conn.execute(
         "SELECT resolution_id, resolved_at, outcome, confidence, evidence, method, p_pred_at_issue FROM resolutions WHERE fact_id = ? ORDER BY resolved_at DESC",
@@ -153,6 +181,7 @@ def get_ts_coefs_for_fact_ids(fact_ids: List[str]) -> Dict[str, float]:
 
 # --- helper: find local file for doc_id ---------------------------------
 def find_local_file_for_doc_id(doc_id: str) -> Optional[str]:
+    """Map a DB doc_id back to a local file path by matching SHA-256 hashes."""
     drow = get_doc_by_id(doc_id)
     if not drow:
         return None
@@ -171,6 +200,12 @@ def find_local_file_for_doc_id(doc_id: str) -> Optional[str]:
 
 # --- robust cleaning & tolerant highlighter -----------------------------
 def _clean_normalised_text_for_display(raw_text: str) -> str:
+    """Prepare normalized text for robust rendering/highlighting.
+
+    The ingestion pipeline can produce HTML-rich text (tables, inline math/XBRL remnants,
+    style spans). This cleaner strips noisy markup and normalizes whitespace so matching
+    extracted quotes is more reliable and display is easier to read.
+    """
     if not raw_text:
         return ""
     text = html.unescape(raw_text)
@@ -199,9 +234,17 @@ def _clean_normalised_text_for_display(raw_text: str) -> str:
     return text.strip()
 
 def _tokens_of(s: str) -> List[str]:
+    """Tokenize text into alphanumeric words for tolerant matching."""
     return re.findall(r"\w+", s, flags=re.UNICODE)
 
 def _first_matching_substring(clean_text: str, phrase: str) -> Optional[Tuple[str, int, int, str]]:
+    """Find a best-effort substring match of `phrase` inside `clean_text`.
+
+    Matching strategy is deliberately tolerant:
+    1) Try a full token sequence regex.
+    2) Fall back to sliding token windows (helps when quote extraction is slightly off).
+    3) Last resort literal case-insensitive substring.
+    """
     words = _tokens_of(phrase)
     if words:
         # Try full sequence
@@ -266,7 +309,7 @@ def _rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
 
 def ts_coef_to_bg_hex(ts_coef: Optional[float], max_abs: float) -> str:
     """
-    Map ts_coef to a background hex colour using a symmetric scale:
+    Map ts_coef to a background colour using a symmetric document-local scale.
       x = ts_coef / max_abs, clamped to [-1, 1]
     Negative interpolates TS_NEG_RGB -> TS_NEU_RGB
     Positive interpolates TS_NEU_RGB -> TS_POS_RGB
@@ -343,6 +386,12 @@ def highlight_text_with_debug(
     phrases_with_ids_and_docids_and_ts: List[Tuple[str, str, Optional[str], Optional[float]]],
     ts_max_abs: float,
 ) -> Tuple[str, List[Dict]]:
+    """Highlight extracted claim quotes in document text and collect match diagnostics.
+
+    Returns:
+    - HTML string with clickable highlights that deep-link to fact details.
+    - Per-phrase debug metadata (matched substring, pattern used, etc.).
+    """
     clean_text = _clean_normalised_text_for_display(text)
     if not phrases_with_ids_and_docids_and_ts:
         return (html.escape(clean_text).replace("\n", "<br/>"), [])
@@ -429,6 +478,8 @@ def highlight_text_with_debug(
     return wrapper, debug_info
 
 # --- restore selection from query params ---------------------------------
+# This allows deep links such as ?fact_id=...&doc_id=..., so opening a URL can
+# directly focus the app on a specific fact/document pair.
 qparams = st.experimental_get_query_params()
 initial_fact = qparams.get("fact_id", [None])[0]
 initial_doc = qparams.get("doc_id", [None])[0]
@@ -440,6 +491,8 @@ if initial_doc:
         st.session_state["selected_doc"] = lf
 
 # --- session state -------------------------------------------------------
+# Streamlit reruns top-to-bottom on interactions; session_state preserves the
+# currently selected document/fact across reruns.
 if "selected_fact" not in st.session_state:
     st.session_state["selected_fact"] = None
 if "selected_doc" not in st.session_state:
@@ -450,6 +503,10 @@ tab_files, tab_unresolved, tab_sources = st.tabs(["Files", "Unresolved forward-l
 
 with tab_files:
     st.header("Input files and facts")
+    # Three-column analyst workflow:
+    # - left: pick a local source file
+    # - middle: read text + see extracted claims
+    # - right: inspect full provenance for selected fact
     cols = st.columns([1, 2, 2])
     left, middle, right = cols
 
@@ -499,6 +556,7 @@ with tab_files:
             else:
                 st.caption("This file hasn't been ingested (no matching sha in DB).")
 
+            # `claims` are doc-specific links to canonical facts plus per-doc scoring metadata.
             claims = list_doc_claims(docrow["doc_id"]) if docrow else []
 
             try:
@@ -506,7 +564,8 @@ with tab_files:
             except Exception as e:
                 raw_text = f"Error reading/normalising file: {e}"
 
-            # Pull ts_coef for all facts in this document (for colour scale)
+            # Pull ts_coef in one batch query so the colour scale is normalized
+            # against the currently opened document's own claim range.
             fact_ids_for_doc = [c.get("fact_id") for c in claims if c.get("fact_id")]
             ts_map = get_ts_coefs_for_fact_ids([fid for fid in fact_ids_for_doc if fid])
 
@@ -540,6 +599,7 @@ with tab_files:
                 if claims:
                     st.markdown(ts_legend_html(ts_max_abs), unsafe_allow_html=True)
 
+                # Optional debug view is useful when a quote wasn't highlighted as expected.
                 if st.checkbox("Show debug: cleaned text & match report", value=False):
                     st.markdown("**CLEANED TEXT (head)**")
                     clean_text = _clean_normalised_text_for_display(raw_text)
@@ -555,6 +615,8 @@ with tab_files:
                 if not claims:
                     st.write("No extracted claims found for this document.")
                 else:
+                    # Each claim row gets a compact colour swatch tied to ts_coef so an analyst
+                    # can visually scan positive/negative importance before opening details.
                     for i, c in enumerate(claims):
                         fact_id = c.get("fact_id")
                         status = c.get("status", "UNKNOWN")
@@ -564,7 +626,7 @@ with tab_files:
                         ts_val = ts_map.get(fact_id, 0.0) if fact_id else 0.0
                         swatch_hex = ts_coef_to_bg_hex(ts_val, ts_max_abs)
 
-                        # Row: [swatch] [button]
+                        # Row layout: [tiny colour swatch] [select/deselect button]
                         sw_col, btn_col = st.columns([0.12, 0.88], gap="small")
                         with sw_col:
                             st.markdown(
