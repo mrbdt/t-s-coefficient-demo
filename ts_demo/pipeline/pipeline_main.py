@@ -12,14 +12,14 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from openai import OpenAI
 
-from awareness_exposure_stage import apply_exposure_and_measure, horizon_prediction
-from claim_extraction_stage import extract_and_deduplicate_claims
-from claim_scoring_stage import score_claim_against_kb
-from chunking_stage import build_chunks
-from document_scoring_stage import persist_document_score
-from fact_storage_stage import upsert_fact
-from ingestion_stage import register_document
-from normalization_stage import normalize_document
+from .awareness_exposure_stage import apply_exposure_and_measure, horizon_prediction
+from .claim_extraction_stage import extract_and_deduplicate_claims
+from .claim_scoring_stage import score_claim_against_kb
+from .chunking_stage import build_chunks
+from .document_scoring_stage import persist_document_score
+from .fact_storage_stage import upsert_fact
+from .ingestion_stage import register_document
+from .normalization_stage import normalize_document
 from ts_system import (
     DB_PATH,
     HORIZON_BUCKETS,

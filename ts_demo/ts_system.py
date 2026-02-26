@@ -1,17 +1,12 @@
-"""
-Core pipeline for the T-S coefficient demo.
+"""Compatibility API surface for the T-S demo system.
 
-High-level flow implemented in this module:
-1) Normalize raw documents (HTML/PDF/DOCX) into plain analysis text.
-2) Ask an LLM to extract atomic valuation-relevant claims.
-3) Deduplicate claims against existing facts using embeddings + fuzzy matching.
-4) Update fact-level probabilities/reliability and compute impact scores.
-5) Persist provenance so analysts can audit every score back to source text.
+Core building blocks are split into smaller modules under `core/`:
+- `core.config` for environment/config constants
+- `core.models` for extraction schemas
+- `core.text_processing` for normalization/chunking helpers
 
-Most functions below are designed to be individually readable and testable:
-- pure scoring/probability helpers (math-only)
-- storage helpers (SQL writes/reads)
-- orchestration helpers (chunking, extraction, ingestion)
+This file keeps legacy function names for scripts/UI while hosting DB, scoring,
+and orchestration utilities.
 """
 
 from __future__ import annotations
@@ -19,394 +14,31 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
-import re
-import math
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pdfplumber
-import requests
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel, ConfigDict, Field
 from rapidfuzz import fuzz
 
-import warnings
-from bs4 import XMLParsedAsHTMLWarning
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+from core.config import (
+    DB_PATH, EMBED_SAME_LOOSE, EMBED_SAME_STRICT, FUZZ_SAME_STRICT, HALF_LIFE_DAYS,
+    HORIZON_BUCKETS, HORIZON_TRADING_DAYS, LAMBDA_DECAY, NEAR_WEIGHTS, OPENAI_EMBED_MODEL,
+    OPENAI_MODEL, SOURCE_REACH, TAU_RELIABILITY_DAYS, TS_MAX_CHUNKS, status_from_similarity,
+)
+from core.models import ExtractedClaim, ExtractedClaims, Polarity
+from core.text_processing import (
+    chunk_text,
+    normalise_to_text,
+    sample_chunks,
+    table_to_markdown_from_bs4,
+    table_to_markdown_from_list,
+)
 
-# -----------------------------
-# Environment / Config
-# -----------------------------
-load_dotenv()
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-DB_PATH = os.getenv("TS_DB_PATH", "ts_kb.sqlite3")
-
-TS_MAX_CHUNKS = int(os.getenv("TS_MAX_CHUNKS", "30"))
-LAMBDA_DECAY = float(os.getenv("TS_LAMBDA_DECAY", "0.002"))  # awareness decay for old exposures
-TAU_RELIABILITY_DAYS = float(os.getenv("TS_TAU_RELIABILITY_DAYS", "365"))  # recency weighting
-
-HORIZON_BUCKETS = ["1D", "1W", "1M", "3M", "1Y", "3Y"]
-HORIZON_TRADING_DAYS = {"1D": 1, "1W": 5, "1M": 21, "3M": 63, "1Y": 252, "3Y": 756}
-
-# Heuristic weights (for "impact now" / UI ranking)
-NEAR_WEIGHTS = {"1D": 1.00, "1W": 0.75, "1M": 0.55, "3M": 0.40, "1Y": 0.25, "3Y": 0.15}
-HALF_LIFE_DAYS = {"1D": 2, "1W": 7, "1M": 30, "3M": 90, "1Y": 365, "3Y": 900}
-
-# Reach defaults (v1)
-SOURCE_REACH = {
-    "SEC_FILING": 0.70,
-    "EARNINGS_CALL": 0.65,
-    "PRESS_RELEASE": 0.75,
-    "NEWS_PAYWALLED": 0.55,
-    "NEWS_FREE": 0.80,
-    "X_CSUITE": 0.60,
-    "X_ANALYST": 0.45,
-    "RUMOUR": 0.25,
-}
-
-# Dedup thresholds
-EMBED_SAME_STRICT = 0.93
-EMBED_SAME_LOOSE = 0.85
-FUZZ_SAME_STRICT = 0.92
-
-# Status labels for demo readability
-def status_from_similarity(sim: float) -> str:
-    """Map a numeric similarity score to a human-readable lifecycle label.
-
-    Why this helper exists:
-    - Analysts prefer categorical tags (NEW/KNOWN/RECONFIRMED) over raw cosine values.
-    - The thresholds are intentionally simple, deterministic, and easy to tune.
-
-    Threshold semantics:
-    - >= 0.95  -> RECONFIRMED: nearly identical claim seen again.
-    - >= 0.65  -> KNOWN: substantially overlaps an existing fact.
-    - <  0.65  -> NEW: treated as a new fact candidate.
-    """
-    if sim >= 0.95:
-        return "RECONFIRMED"
-    if sim >= 0.65:
-        return "KNOWN"
-    return "NEW"
-
-
-# -----------------------------
-# Structured extraction schema
-# -----------------------------
-Polarity = Literal["BULLISH", "BEARISH", "MIXED", "NEUTRAL"]
-Modality = Literal["ASSERTION", "FORECAST", "INTENTION", "CONDITIONAL", "RISK", "OPINION"]
-Evidential = Literal["REPORTED_NUMBER", "OPERATIONAL_OBSERVATION", "INTERNAL_METRIC", "UNSPECIFIED"]
-SpeakerRole = Literal["COMPANY_OFFICIAL", "MANAGEMENT", "ANALYST", "OTHER"]
-
-class ExtractedClaim(BaseModel):
-    # Core claim
-    claim: str = Field(..., description="Atomic, standalone claim. Include key numbers and the relevant period if present.")
-    polarity: Polarity = Field(..., description="BULLISH/BEARISH/MIXED/NEUTRAL")
-    materiality_0_1: float = Field(..., ge=0.0, le=1.0, description="If true and broadly known, how valuation-relevant is it?")
-    credibility_0_1: float = Field(..., ge=0.0, le=1.0, description="How likely true given the source and wording?")
-    surprise_0_1: float = Field(..., ge=0.0, le=1.0, description="How unexpected vs common priors for this company/sector?")
-    class HorizonProfile(BaseModel):
-        """Fixed horizon buckets for structured-output schema compatibility."""
-
-        model_config = ConfigDict(populate_by_name=True)
-
-        one_day: float = Field(..., ge=0.0, le=1.0, alias="1D")
-        one_week: float = Field(..., ge=0.0, le=1.0, alias="1W")
-        one_month: float = Field(..., ge=0.0, le=1.0, alias="1M")
-        three_month: float = Field(..., ge=0.0, le=1.0, alias="3M")
-        one_year: float = Field(..., ge=0.0, le=1.0, alias="1Y")
-        three_year: float = Field(..., ge=0.0, le=1.0, alias="3Y")
-
-        def as_dict(self) -> Dict[str, float]:
-            return self.model_dump(by_alias=True)
-
-    horizon_profile: HorizonProfile = Field(..., description="Distribution over 1D/1W/1M/3M/1Y/3Y; should sum ~1.0.")
-    rationale: str = Field(..., description="One paragraph on why this matters for valuation.")
-    quote: str = Field(..., description="Exact supporting quote/snippet from the chunk.")
-
-    # Pragmatics / attribution
-    is_forward_looking: bool = Field(..., description="True if the claim is about future expectations, guidance, intentions, or projected outcomes.")
-    modality: Modality = Field(..., description="ASSERTION/FORECAST/INTENTION/CONDITIONAL/RISK/OPINION")
-    commitment_0_1: float = Field(..., ge=0.0, le=1.0, description="Higher for 'will'/'we will'; lower for 'may'/'could'.")
-    conditionality_0_1: float = Field(..., ge=0.0, le=1.0, description="Higher when heavily conditional ('if', 'subject to', 'depending on').")
-    evidential_basis: Evidential = Field(..., description="Is it a reported number, observation, internal metric, or unspecified?")
-    speaker_role: SpeakerRole = Field(..., description="Who is effectively the source of the quoted snippet?")
-
-class ExtractedClaims(BaseModel):
-    claims: List[ExtractedClaim]
-
-
-# -----------------------------
-# Text normalisation
-# -----------------------------
-def table_to_markdown_from_bs4(table_tag) -> str:
-    """Convert an HTML table (`bs4` tag) into markdown text.
-
-    This makes tabular financial data visible to LLM extraction in plain text form
-    without requiring HTML understanding at inference time.
-    """
-    rows = []
-    for tr in table_tag.find_all("tr"):
-        cells = []
-        for td in tr.find_all(["th", "td"]):
-            text = td.get_text(" ", strip=True)
-            cells.append(text.replace("\n", " ").strip())
-        if cells:
-            rows.append(cells)
-
-    if not rows:
-        return ""
-
-    max_cols = max(len(r) for r in rows)
-    for r in rows:
-        while len(r) < max_cols:
-            r.append("")
-
-    header = rows[0]
-    if all((h == "" or any(ch.isalpha() for ch in h)) for h in header):
-        body = rows[1:]
-    else:
-        header = [f"col{i+1}" for i in range(max_cols)]
-        body = rows
-
-    md_lines = []
-    md_lines.append("| " + " | ".join(header) + " |")
-    md_lines.append("| " + " | ".join(["---"] * max_cols) + " |")
-    for r in body:
-        md_lines.append("| " + " | ".join(r) + " |")
-    return "\n".join(md_lines)
-
-
-def table_to_markdown_from_list(table: List[List[str]]) -> str:
-    """Convert a `pdfplumber` list-of-lists table into markdown text.
-
-    PDF extraction often yields ragged rows (different column counts by row).
-    We pad rows to a consistent width so downstream consumers get stable structure.
-    """
-    if not table:
-        return ""
-    max_cols = max(len(r) for r in table)
-    rows = [list(map(lambda x: (x or "").strip().replace("\n", " "), r)) for r in table]
-    for r in rows:
-        while len(r) < max_cols:
-            r.append("")
-    header = rows[0] if any(cell.isalpha() for cell in " ".join(rows[0])) else [f"col{i+1}" for i in range(max_cols)]
-    body = rows[1:] if header == rows[0] else rows
-
-    md_lines = []
-    md_lines.append("| " + " | ".join(header) + " |")
-    md_lines.append("| " + " | ".join(["---"] * max_cols) + " |")
-    for r in body:
-        md_lines.append("| " + " | ".join(r) + " |")
-    return "\n".join(md_lines)
-
-
-def normalise_to_text(path: Path | str) -> str:
-    """Convert heterogeneous source files into analysis-friendly text.
-
-    Design goals:
-    - Preserve economically relevant content (including tables and inline XBRL facts).
-    - Remove markup noise that hurts extraction quality.
-    - Return a single plain-text representation regardless of input format.
-    """
-    path = Path(path)
-    ext = path.suffix.lower()
-
-    if ext == ".pdf":
-        parts: List[str] = []
-        with pdfplumber.open(str(path)) as pdf:
-            for page_no, page in enumerate(pdf.pages, start=1):
-                try:
-                    tables = page.extract_tables()
-                except Exception:
-                    tables = []
-
-                for t in tables:
-                    md = table_to_markdown_from_list(t)
-                    if md:
-                        parts.append(f"[START_TABLE page={page_no}]\n{md}\n[END_TABLE]\n")
-
-                txt = page.extract_text() or ""
-                if txt.strip():
-                    parts.append(txt)
-        return "\n\n".join(parts)
-
-    if ext in {".html", ".htm"}:
-        html = path.read_text(errors="ignore")
-        soup = BeautifulSoup(html, "lxml")
-
-        # Drop scripts/styles
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-
-        # Remove taxonomy / XBRL href anchors, replace other anchors with their text
-        for a in list(soup.find_all("a")):
-            href = (a.get("href") or "").strip()
-            txt = a.get_text(" ", strip=True)
-            # Remove noisy taxonomy/XBRL links
-            if href.startswith("http://fasb.org") or href.startswith("https://fasb.org") \
-               or href.startswith("http://www.xbrl.org") or href.startswith("https://www.xbrl.org") \
-               or txt.startswith("http://fasb.org") or txt.startswith("http://www.xbrl.org"):
-                a.decompose()
-            else:
-                a.replace_with(txt)
-
-        # Convert inline XBRL (ix:*, ixbrl:*, etc.) into readable markers.
-        # This function is conservative: it does not drop facts, it replaces tags with a readable text line.
-        def _extract_inline_xbrl_as_text(soup) -> None:
-            """
-            Replace inline XBRL tags with readable markers.
-            This function:
-            - treats tags whose tag-name contains a colon (e.g. us-gaap:Revenue) as concepts,
-            - also looks for attributes like 'name' or 'concept',
-            - sanitises the value by removing taxonomy URLs and excessive whitespace,
-            - replaces the tag in-place with a single-line [XBRL_FACT] marker.
-            """
-            def _clean_text(s: str) -> str:
-                if not s:
-                    return ""
-                # remove common taxonomy / xbrl urls entirely
-                s = re.sub(r'https?://(?:www\.)?fasb\.org[^\s]*', '', s)
-                s = re.sub(r'https?://(?:www\.)?xbrl\.org[^\s]*', '', s)
-                s = re.sub(r'https?://[^\s#]*#[^\s]*', '', s)  # catch other fragment URLs
-                # normalise whitespace
-                s = re.sub(r'[\s\n\r]+', ' ', s).strip()
-                return s
-
-            # enumerate tags and replace XBRL-like items
-            for tag in list(soup.find_all()):
-                name = getattr(tag, "name", "") or ""
-                try:
-                    lname = name.lower()
-                except Exception:
-                    lname = ""
-                is_xbrl_like = (":" in name) or lname.startswith("ix:") or lname.startswith("ixbrl:") or lname.startswith("xbrli:")
-                if not is_xbrl_like:
-                    continue
-
-                # concept: prefer the tag name (e.g. us-gaap:Revenue), else attributes 'name'/'concept'/'id'
-                concept = str(name)
-                if not concept or concept.strip() == "":
-                    concept = tag.get("name") or tag.get("concept") or tag.get("id") or ""
-                concept = _clean_text(str(concept)).strip()
-
-                # value: text inside tag, cleaned
-                val = _clean_text(tag.get_text(" ", strip=True))
-
-                # context/unit/decimals if present
-                context = _clean_text(tag.get("contextref") or tag.get("contextRef") or tag.get("context") or "")
-                unit = _clean_text(tag.get("unitref") or tag.get("unitRef") or tag.get("unit") or "")
-                decimals = _clean_text(tag.get("decimals") or "")
-
-                # build marker
-                md = f"[XBRL_FACT] concept={concept} value={val}"
-                if context:
-                    md += f" context={context}"
-                if unit:
-                    md += f" unit={unit}"
-                if decimals:
-                    md += f" decimals={decimals}"
-
-                # replace the tag node with the marker
-                try:
-                    tag.replace_with(md)
-                except Exception:
-                    # if replace fails, try to insert text and decompose tag
-                    tag.insert_after(md)
-                    tag.decompose()
-
-
-        # Convert inline XBRL facts to readable text (conservative replacement)
-        try:
-            _extract_inline_xbrl_as_text(soup)
-        except Exception:
-            # if parsing fails, continue — we still have text fallback
-            pass
-
-        # Convert explicit tables to markdown blocks (existing behavior)
-        for table in list(soup.find_all("table")):
-            try:
-                md = table_to_markdown_from_bs4(table)
-                if md:
-                    md_block = soup.new_tag("p")
-                    md_block.string = f"\n\n[START_TABLE]\n{md}\n[END_TABLE]\n\n"
-                    table.replace_with(md_block)
-            except Exception:
-                continue
-
-        text = soup.get_text("\n")
-
-        # FINAL CLEANUP: remove remaining taxonomy URLs / fragments and normalise whitespace
-        # remove fasb/xbrl urls
-        text = re.sub(r'https?://(?:www\.)?fasb\.org[^\s\n]*', '', text)
-        text = re.sub(r'https?://(?:www\.)?xbrl\.org[^\s\n]*', '', text)
-        # remove any remaining fragment URLs that include '#'
-        text = re.sub(r'https?://[^\s\n]*#[^\s\n]*', '', text)
-        # collapse whitespace
-        text = re.sub(r'[\s\n\r]+', ' ', text).strip()
-
-        # Put back sensible newlines for markers and tables
-        text = text.replace('[START_TABLE]', '\n[START_TABLE]').replace('[END_TABLE]', '[END_TABLE]\n')
-        text = text.replace('[XBRL_FACT]', '\n[XBRL_FACT]')
-
-        # Trim and return
-        return text
-
-    if ext == ".docx":
-        from docx import Document as DocxDocument
-        doc = DocxDocument(str(path))
-        paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-        return "\n\n".join(paras)
-
-    return path.read_text(errors="ignore")
-
-
-def chunk_text(text: str, max_chars: int = 7000, overlap: int = 700) -> List[str]:
-    """Split long text into overlapping windows for LLM extraction.
-
-    Overlap is intentional: claims near boundaries should still appear fully in at
-    least one chunk so we do not lose context-sensitive statements.
-    """
-    text = text.strip()
-    if not text:
-        return []
-    chunks: List[str] = []
-    i = 0
-    while i < len(text):
-        j = min(len(text), i + max_chars)
-        chunks.append(text[i:j])
-        if j == len(text):
-            break
-        i = max(0, j - overlap)
-    return chunks
-
-
-def sample_chunks(chunks: List[str], k: int) -> List[str]:
-    """Subsample chunks when documents are huge to cap extraction cost.
-
-    Heuristic keeps early, middle, and late sections to preserve narrative coverage.
-    """
-    if len(chunks) <= k:
-        return chunks
-    # start / middle / end sampling
-    a = chunks[: max(1, k // 3)]
-    mid_start = max(0, len(chunks) // 2 - max(1, k // 6))
-    b = chunks[mid_start: mid_start + max(1, k // 3)]
-    c = chunks[-max(1, k // 3):]
-    out = a + b + c
-    return out[:k]
-
-
-# -----------------------------
-# DB schema
-# -----------------------------
 def init_db(conn: sqlite3.Connection) -> None:
     """Create all required tables and indexes for the demo knowledge base."""
     conn.execute("""
@@ -1343,7 +975,7 @@ def ingest_document(
     as_of: Optional[dt.datetime] = None,
 ) -> IngestResult:
     """Ingest a single source document via the staged pipeline orchestrator."""
-    from pipeline_main import ingest_document_pipeline
+    from pipeline.pipeline_main import ingest_document_pipeline
 
     result = ingest_document_pipeline(
         path=path,
