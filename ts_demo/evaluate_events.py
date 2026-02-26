@@ -33,10 +33,10 @@ def fit_market_model(r_stock: np.ndarray, r_mkt: np.ndarray) -> tuple[float, flo
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=os.getenv("TS_DB_PATH", "ts_kb.sqlite3"))
+    ap.add_argument("--db", default=os.getenv("TS_DB_PATH", "data/output/ts_kb_GOOGL_demo.sqlite3"))
     ap.add_argument("--ticker", default="GOOGL")
     ap.add_argument("--market", default="SPY")
-    ap.add_argument("--out", default="eval_results.csv")
+    ap.add_argument("--out", default="data/output/eval_results.csv")
     args = ap.parse_args()
 
     conn = sqlite3.connect(args.db)
