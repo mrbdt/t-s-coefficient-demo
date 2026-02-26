@@ -7,6 +7,7 @@ mid-semester demo of the t-s-coefficient
   - `config.py` (environment + constants)
   - `models.py` (pydantic claim schemas)
   - `text_processing.py` (document normalization/chunking)
+  - `database.py`, `scoring.py`, `extraction.py`, `reliability.py`, `query.py`, `ingest_api.py` (split runtime logic by responsibility)
 - `ts_demo/pipeline/` → ingestion pipeline stages + orchestrator.
 - `ts_demo/data/input/` → downloaded/raw demo source documents.
 - `ts_demo/data/output/` → generated artifacts (DB, eval CSV, docs manifest).

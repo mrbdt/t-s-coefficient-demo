@@ -63,9 +63,9 @@ def ingest_document_pipeline(
     as_of = as_of or timestamp
     client = OpenAI()
 
-    import ts_system as ts
-    if ts.STRUCTURED_PARSE_ENABLED:
-        ts.STRUCTURED_PARSE_ENABLED = _supports_structured_parse(client)
+    from core import extraction as extraction_core
+    if extraction_core.STRUCTURED_PARSE_ENABLED:
+        extraction_core.STRUCTURED_PARSE_ENABLED = _supports_structured_parse(client)
 
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
