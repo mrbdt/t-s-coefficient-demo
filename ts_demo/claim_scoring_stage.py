@@ -39,7 +39,7 @@ def score_claim_against_kb(
     same_fact = matched_id is not None and treat_as_same_fact(embed_sim=best_sim, fuzz_sim=fuzz_sim)
 
     sign = polarity_to_sign(claim.polarity)
-    horizon = normalise_horizon(claim.horizon_profile)
+    horizon = normalise_horizon(claim.horizon_profile.as_dict())
     source_id = f"{ticker}:{claim.speaker_role}"
     rel = get_source_reliability(conn, source_id)
 

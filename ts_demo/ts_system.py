@@ -33,7 +33,7 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from rapidfuzz import fuzz
 
 import warnings
@@ -112,7 +112,22 @@ class ExtractedClaim(BaseModel):
     materiality_0_1: float = Field(..., ge=0.0, le=1.0, description="If true and broadly known, how valuation-relevant is it?")
     credibility_0_1: float = Field(..., ge=0.0, le=1.0, description="How likely true given the source and wording?")
     surprise_0_1: float = Field(..., ge=0.0, le=1.0, description="How unexpected vs common priors for this company/sector?")
-    horizon_profile: Dict[str, float] = Field(..., description="Distribution over 1D/1W/1M/3M/1Y/3Y; should sum ~1.0.")
+    class HorizonProfile(BaseModel):
+        """Fixed horizon buckets for structured-output schema compatibility."""
+
+        model_config = ConfigDict(populate_by_name=True)
+
+        one_day: float = Field(..., ge=0.0, le=1.0, alias="1D")
+        one_week: float = Field(..., ge=0.0, le=1.0, alias="1W")
+        one_month: float = Field(..., ge=0.0, le=1.0, alias="1M")
+        three_month: float = Field(..., ge=0.0, le=1.0, alias="3M")
+        one_year: float = Field(..., ge=0.0, le=1.0, alias="1Y")
+        three_year: float = Field(..., ge=0.0, le=1.0, alias="3Y")
+
+        def as_dict(self) -> Dict[str, float]:
+            return self.model_dump(by_alias=True)
+
+    horizon_profile: HorizonProfile = Field(..., description="Distribution over 1D/1W/1M/3M/1Y/3Y; should sum ~1.0.")
     rationale: str = Field(..., description="One paragraph on why this matters for valuation.")
     quote: str = Field(..., description="Exact supporting quote/snippet from the chunk.")
 
