@@ -14,6 +14,11 @@ from ts_system import HORIZON_BUCKETS, HORIZON_TRADING_DAYS, init_db
 
 load_dotenv()
 
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+USER_INPUT_DIR = DATA_DIR / "input" / "user_input"
+OUTPUT_DIR = DATA_DIR / "output"
+
 
 def market_event_date(ts: dt.datetime) -> pd.Timestamp:
     """
@@ -51,13 +56,13 @@ def load_eval_config(path: str | Path) -> dict:
 
 def default_output_path(ticker: str) -> str:
     stamp = dt.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    return f"data/output/{ticker}-eval-{stamp}.csv"
+    return str(OUTPUT_DIR / f"{ticker}-eval-{stamp}.csv")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=os.getenv("TS_DB_PATH", "data/output/ts_kb_GOOGL_demo.sqlite3"))
-    ap.add_argument("--config", default=os.getenv("EVAL_CONFIG_PATH", "data/input/user_input/eval_config.json"))
+    ap.add_argument("--db", default=os.getenv("TS_DB_PATH", str(OUTPUT_DIR / "ts_kb_GOOGL_demo.sqlite3")))
+    ap.add_argument("--config", default=os.getenv("EVAL_CONFIG_PATH", str(USER_INPUT_DIR / "eval_config.json")))
     ap.add_argument("--ticker", default=None, help="Optional override for ticker in eval config.")
     ap.add_argument("--market", default=None, help="Optional override for market benchmark in eval config.")
     ap.add_argument("--out", default=None, help="Optional output CSV path. Defaults to timestamped file in data/output.")
