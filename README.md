@@ -30,7 +30,7 @@ rm -f data/output/googl_eval.csv
 find data/input -mindepth 1 -delete
 ```
 
-Run the ingestion and watch the terminal:
+Run the ingestion and watch the terminal (from inside `ts_demo/`):
 
 ```bash
 python run_googl_demo.py
