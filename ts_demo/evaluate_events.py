@@ -3,15 +3,22 @@ import datetime as dt
 import json
 import os
 import sqlite3
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 
-from ts_system import HORIZON_BUCKETS, HORIZON_TRADING_DAYS, init_db
+from ts_system import DB_PATH, HORIZON_BUCKETS, HORIZON_TRADING_DAYS, init_db
 
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+USER_INPUT_DIR = DATA_DIR / "input" / "user_input"
+OUTPUT_DIR = DATA_DIR / "output"
+
 
 def market_event_date(ts: dt.datetime) -> pd.Timestamp:
     """
@@ -23,6 +30,7 @@ def market_event_date(ts: dt.datetime) -> pd.Timestamp:
         date += pd.Timedelta(days=1)
     return date
 
+
 def fit_market_model(r_stock: np.ndarray, r_mkt: np.ndarray) -> tuple[float, float]:
     """
     OLS: r_stock = alpha + beta * r_mkt
@@ -31,13 +39,39 @@ def fit_market_model(r_stock: np.ndarray, r_mkt: np.ndarray) -> tuple[float, flo
     alpha = float(np.mean(r_stock) - beta * np.mean(r_mkt))
     return alpha, beta
 
+
+def load_eval_config(path: str | Path) -> dict:
+    cfg_path = Path(path)
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Evaluation config not found: {cfg_path.resolve()}")
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(cfg, dict):
+        raise ValueError("Evaluation config must be a JSON object.")
+    ticker = str(cfg.get("ticker", "")).strip().upper()
+    market = str(cfg.get("market", "")).strip().upper()
+    if not ticker or not market:
+        raise ValueError("Evaluation config must contain non-empty 'ticker' and 'market' fields.")
+    return {"ticker": ticker, "market": market}
+
+
+def default_output_path(ticker: str) -> str:
+    stamp = dt.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    return str(OUTPUT_DIR / f"{ticker}-eval-{stamp}.csv")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=os.getenv("TS_DB_PATH", "data/output/ts_kb_GOOGL_demo.sqlite3"))
-    ap.add_argument("--ticker", default="GOOGL")
-    ap.add_argument("--market", default="SPY")
-    ap.add_argument("--out", default="data/output/eval_results.csv")
+    ap.add_argument("--db", default=DB_PATH)
+    ap.add_argument("--config", default=os.getenv("EVAL_CONFIG_PATH", str(USER_INPUT_DIR / "eval_config.json")))
+    ap.add_argument("--ticker", default=None, help="Optional override for ticker in eval config.")
+    ap.add_argument("--market", default=None, help="Optional override for market benchmark in eval config.")
+    ap.add_argument("--out", default=None, help="Optional output CSV path. Defaults to timestamped file in data/output.")
     args = ap.parse_args()
+
+    cfg = load_eval_config(args.config)
+    ticker = (args.ticker or cfg["ticker"]).upper()
+    market = (args.market or cfg["market"]).upper()
+    out_path = args.out or default_output_path(ticker)
 
     conn = sqlite3.connect(args.db)
     init_db(conn)
@@ -46,7 +80,7 @@ def main():
         "SELECT d.doc_id, d.timestamp, s.pred_horizon_json "
         "FROM docs d JOIN doc_scores s ON d.doc_id = s.doc_id "
         "WHERE d.ticker = ? ORDER BY d.timestamp ASC",
-        (args.ticker,),
+        (ticker,),
     )
     events = [(doc_id, dt.datetime.fromisoformat(ts), json.loads(pred_h)) for doc_id, ts, pred_h in cur.fetchall()]
     conn.close()
@@ -58,14 +92,14 @@ def main():
     start = min(ts for _, ts, _ in events) - dt.timedelta(days=300)
     end = max(ts for _, ts, _ in events) + dt.timedelta(days=180)
 
-    px = yf.download([args.ticker, args.market], start=start.date().isoformat(), end=end.date().isoformat(), auto_adjust=True, progress=False)
+    px = yf.download([ticker, market], start=start.date().isoformat(), end=end.date().isoformat(), auto_adjust=True, progress=False)
     if isinstance(px.columns, pd.MultiIndex):
         close = px["Close"].copy()
     else:
         close = px[["Close"]].copy()
 
     close = close.dropna(how="all")
-    if args.ticker not in close.columns or args.market not in close.columns:
+    if ticker not in close.columns or market not in close.columns:
         raise SystemExit("Price download missing expected tickers. Check ticker symbols / network.")
 
     rets = close.pct_change().dropna()
@@ -97,8 +131,8 @@ def main():
             skipped += 1
             continue
 
-        r_stock = rets[args.ticker].iloc[est_start:est_end].to_numpy()
-        r_mkt = rets[args.market].iloc[est_start:est_end].to_numpy()
+        r_stock = rets[ticker].iloc[est_start:est_end].to_numpy()
+        r_mkt = rets[market].iloc[est_start:est_end].to_numpy()
         alpha, beta = fit_market_model(r_stock, r_mkt)
 
         row = {
@@ -118,8 +152,8 @@ def main():
         for b in HORIZON_BUCKETS:
             n = HORIZON_TRADING_DAYS[b]
             idx1 = min(len(rets) - 1, idx0 + n)
-            r_s = rets[args.ticker].iloc[idx0:idx1].to_numpy()
-            r_m = rets[args.market].iloc[idx0:idx1].to_numpy()
+            r_s = rets[ticker].iloc[idx0:idx1].to_numpy()
+            r_m = rets[market].iloc[idx0:idx1].to_numpy()
             ar = r_s - (alpha + beta * r_m)
             car = float(np.sum(ar))
             row[f"CAR_{b}"] = car
@@ -163,8 +197,10 @@ def main():
         hit = float(np.mean(pred_sign == car_sign))
         print(f"{b}: {hit:.2%} (n={len(sub)})")
 
-    df.to_csv(args.out, index=False)
-    print(f"\nSaved: {args.out}")
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False)
+    print(f"\nSaved: {out_path}")
+
 
 if __name__ == "__main__":
     main()
