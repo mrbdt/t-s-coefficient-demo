@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-DB_PATH = os.getenv("TS_DB_PATH", "ts_kb.sqlite3")
+BASE_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_DB_PATH = BASE_DIR / "data" / "output" / "ts_kb_GOOGL_demo.sqlite3"
+DB_PATH = os.getenv("TS_DB_PATH", str(DEFAULT_DB_PATH))
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 TS_MAX_CHUNKS = int(os.getenv("TS_MAX_CHUNKS", "30"))
 LAMBDA_DECAY = float(os.getenv("TS_LAMBDA_DECAY", "0.002"))

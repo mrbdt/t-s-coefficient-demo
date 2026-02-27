@@ -30,8 +30,14 @@ from ts_system import ingest_document
 
 load_dotenv()
 
-OUTDIR = Path("data/input")
-OUTDIR.mkdir(parents=True, exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+USER_INPUT_DIR = DATA_DIR / "input" / "user_input"
+INGESTED_DIR = DATA_DIR / "input" / "ingested"
+OUTPUT_DIR = DATA_DIR / "output"
+USER_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+INGESTED_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SEC_UA = os.environ.get("SEC_USER_AGENT", "GOOGL-demo/1.0 (my.email@example.com)")
 
@@ -100,7 +106,7 @@ def load_docs_from_json(path: str | Path = "googl_docs.json"):
 
 # Resolve manifest path from env for easy scenario switching in demos/tests.
 # Example: DOCS_JSON_PATH=docs_alt.json python ts_demo/run_googl_demo.py
-DOCS_JSON_PATH = os.environ.get("DOCS_JSON_PATH", "data/output/docs.json")
+DOCS_JSON_PATH = Path(os.environ.get("DOCS_JSON_PATH", str(USER_INPUT_DIR / "docs.json")))
 DOCS = load_docs_from_json(DOCS_JSON_PATH)
 
 def download(url: str, outpath: Path) -> None:
@@ -120,13 +126,13 @@ def main() -> None:
     horizon predictions, near-term aggregate score, and top ranked claims.
     """
     # Echo key runtime config so saved logs are self-describing and reproducible.
-    print("DB:", os.environ.get("TS_DB_PATH"))
+    print("DB:", os.environ.get("TS_DB_PATH", str(OUTPUT_DIR / "ts_kb_GOOGL_demo.sqlite3")))
     print("LLM Model Used:", os.environ.get("OPENAI_MODEL"))
     print("Embed Model Used:", os.environ.get("OPENAI_EMBED_MODEL"))
     # Process documents in chronological order supplied by the manifest so results
     # resemble a walk-forward analyst workflow.
     for i, d in enumerate(DOCS, start=1):
-        path = OUTDIR / f"{i:02d}_{d['name']}{d['suffix']}"
+        path = INGESTED_DIR / f"{i:02d}_{d['name']}{d['suffix']}"
 
         # Skip network work when the file has already been downloaded locally.
         if not path.exists():
