@@ -9,8 +9,19 @@ load_dotenv()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 BASE_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_DB_PATH = BASE_DIR / "data" / "output" / "ts_kb_GOOGL_demo.sqlite3"
-DB_PATH = os.getenv("TS_DB_PATH", str(DEFAULT_DB_PATH))
+OUTPUT_DIR = BASE_DIR / "data" / "output"
+
+_db_env = os.getenv("TS_DB_PATH")
+if _db_env:
+    _db_path = Path(_db_env).expanduser()
+    if not _db_path.is_absolute():
+        # Keep relative env overrides inside the canonical output directory.
+        _db_path = OUTPUT_DIR / _db_path.name
+else:
+    # Fallback keeps output in canonical directory without hardcoding a project-specific DB filename.
+    _db_path = OUTPUT_DIR / f"{BASE_DIR.name}.sqlite3"
+
+DB_PATH = str(_db_path)
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 TS_MAX_CHUNKS = int(os.getenv("TS_MAX_CHUNKS", "30"))

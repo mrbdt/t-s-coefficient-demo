@@ -35,6 +35,7 @@ try:
         normalise_to_text,
         sha256_file,
         get_doc_by_sha,
+        DB_PATH,
     )
 except Exception:
     import ts_system as ts_sys  # type: ignore
@@ -46,13 +47,13 @@ except Exception:
     normalise_to_text = getattr(ts_sys, "normalise_to_text")
     sha256_file = getattr(ts_sys, "sha256_file")
     get_doc_by_sha = getattr(ts_sys, "get_doc_by_sha", None)
+    DB_PATH = getattr(ts_sys, "DB_PATH")
 
 load_dotenv()
 
 st.set_page_config(page_title="T-S Demo — Files & Facts", layout="wide")
 st.title("T-S Prototype — Files, Facts & Provenance (Docs → Facts)")
 
-DB_PATH = os.getenv("TS_DB_PATH", "data/output/ts_kb_GOOGL_demo.sqlite3")
 st.caption(f"DB: {DB_PATH}")
 
 INPUT_DIR = Path("data/input")

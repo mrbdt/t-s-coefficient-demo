@@ -26,7 +26,7 @@ import json
 import requests
 from dotenv import load_dotenv
 
-from ts_system import ingest_document
+from ts_system import DB_PATH, ingest_document
 
 load_dotenv()
 
@@ -126,7 +126,7 @@ def main() -> None:
     horizon predictions, near-term aggregate score, and top ranked claims.
     """
     # Echo key runtime config so saved logs are self-describing and reproducible.
-    print("DB:", os.environ.get("TS_DB_PATH", str(OUTPUT_DIR / "ts_kb_GOOGL_demo.sqlite3")))
+    print("DB:", DB_PATH)
     print("LLM Model Used:", os.environ.get("OPENAI_MODEL"))
     print("Embed Model Used:", os.environ.get("OPENAI_EMBED_MODEL"))
     # Process documents in chronological order supplied by the manifest so results

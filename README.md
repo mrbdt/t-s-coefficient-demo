@@ -21,12 +21,20 @@ Activate the venv (if not already) (do so within the ts_demo folder):
 source .venv/bin/activate
 ```
 
+Load environment variables so `TS_DB_PATH` and model settings are available:
+
+```bash
+set -a
+source .env
+set +a
+```
+
 If not yet present, create a `.env` file for environment parameters. see `.env.example` for fields that needs to be filled in.
 
 (optional) Re-create a clean DB, clear the inputs folder, clear the evaluation output (for a clear demo):
 
 ```bash
-rm -f data/output/ts_kb_GOOGL_demo.sqlite3
+rm -f "$TS_DB_PATH"
 rm -f data/output/*-eval-*.csv data/output/googl_eval.csv
 find data/input/ingested -mindepth 1 -delete
 ```

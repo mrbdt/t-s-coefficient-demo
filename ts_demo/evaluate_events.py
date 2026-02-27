@@ -10,7 +10,7 @@ import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 
-from ts_system import HORIZON_BUCKETS, HORIZON_TRADING_DAYS, init_db
+from ts_system import DB_PATH, HORIZON_BUCKETS, HORIZON_TRADING_DAYS, init_db
 
 load_dotenv()
 
@@ -61,7 +61,7 @@ def default_output_path(ticker: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=os.getenv("TS_DB_PATH", str(OUTPUT_DIR / "ts_kb_GOOGL_demo.sqlite3")))
+    ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--config", default=os.getenv("EVAL_CONFIG_PATH", str(USER_INPUT_DIR / "eval_config.json")))
     ap.add_argument("--ticker", default=None, help="Optional override for ticker in eval config.")
     ap.add_argument("--market", default=None, help="Optional override for market benchmark in eval config.")
