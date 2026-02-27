@@ -52,12 +52,12 @@ load_dotenv()
 st.set_page_config(page_title="T-S Demo — Files & Facts", layout="wide")
 st.title("T-S Prototype — Files, Facts & Provenance (Docs → Facts)")
 
-DB_PATH = os.getenv("TS_DB_PATH", "ts_kb.sqlite3")
+DB_PATH = os.getenv("TS_DB_PATH", "data/output/ts_kb_GOOGL_demo.sqlite3")
 st.caption(f"DB: {DB_PATH}")
 
-INPUT_DIR = Path("googl_demo_inputs")
+INPUT_DIR = Path("data/input")
 if not INPUT_DIR.exists():
-    alt = Path("ts_demo") / "googl_demo_inputs"
+    alt = Path("ts_demo") / "data" / "input"
     if alt.exists():
         INPUT_DIR = alt
 

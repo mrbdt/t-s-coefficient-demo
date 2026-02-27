@@ -30,7 +30,7 @@ from ts_system import ingest_document
 
 load_dotenv()
 
-OUTDIR = Path("googl_demo_inputs")
+OUTDIR = Path("data/input")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 SEC_UA = os.environ.get("SEC_USER_AGENT", "GOOGL-demo/1.0 (my.email@example.com)")
@@ -100,7 +100,7 @@ def load_docs_from_json(path: str | Path = "googl_docs.json"):
 
 # Resolve manifest path from env for easy scenario switching in demos/tests.
 # Example: DOCS_JSON_PATH=docs_alt.json python ts_demo/run_googl_demo.py
-DOCS_JSON_PATH = os.environ.get("DOCS_JSON_PATH", "docs.json")
+DOCS_JSON_PATH = os.environ.get("DOCS_JSON_PATH", "data/output/docs.json")
 DOCS = load_docs_from_json(DOCS_JSON_PATH)
 
 def download(url: str, outpath: Path) -> None:
@@ -130,11 +130,11 @@ def main() -> None:
 
         # Skip network work when the file has already been downloaded locally.
         if not path.exists():
-            print(f"\n[{i}/7] Downloading {d['name']} ...")
+            print(f"\n[{i}/{len(DOCS)}] Downloading {d['name']} ...")
             download(d["url"], path)
             time.sleep(0.8)  # polite throttle
 
-        print(f"[{i}/7] Ingesting {d['name']} @ {d['timestamp'].isoformat()} ...")
+        print(f"[{i}/{len(DOCS)}] Ingesting {d['name']} @ {d['timestamp'].isoformat()} ...")
         # `as_of` is set to the same document timestamp to emulate a realistic
         # "what was known at that time" run.
         res = ingest_document(
