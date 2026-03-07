@@ -52,7 +52,7 @@ def main():
     conn.close()
 
     if not events:
-        raise SystemExit("No events found in DB. Run run_googl_demo.py first.")
+        raise SystemExit("No events found in DB. Run run_ingest.py first.")
 
     # Download prices covering all events
     start = min(ts for _, ts, _ in events) - dt.timedelta(days=300)

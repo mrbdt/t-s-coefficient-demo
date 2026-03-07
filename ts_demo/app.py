@@ -55,9 +55,9 @@ st.title("T-S Prototype — Files, Facts & Provenance (Docs → Facts)")
 DB_PATH = os.getenv("TS_DB_PATH", "ts_kb.sqlite3")
 st.caption(f"DB: {DB_PATH}")
 
-INPUT_DIR = Path("googl_demo_inputs")
+INPUT_DIR = Path("ingested_inputs")
 if not INPUT_DIR.exists():
-    alt = Path("ts_demo") / "googl_demo_inputs"
+    alt = Path("ts_demo") / "ingested_inputs"
     if alt.exists():
         INPUT_DIR = alt
 
@@ -518,7 +518,7 @@ with tab_files:
         else:
             files = sorted([p for p in INPUT_DIR.iterdir() if p.is_file()])
             if not files:
-                st.info(f"No files found in {INPUT_DIR}. Run run_googl_demo.py first.")
+                st.info(f"No files found in {INPUT_DIR}. Run run_ingest.py first.")
             else:
                 for f in files:
                     try:
