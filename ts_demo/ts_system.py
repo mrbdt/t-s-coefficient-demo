@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -47,7 +48,20 @@ load_dotenv()
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-DB_PATH = os.getenv("TS_DB_PATH", "ts_kb.sqlite3")
+DB_PATH = os.getenv("TS_DB_PATH", "system_db.sqlite3")
+
+PIPELINE_DIR = Path(os.getenv("TS_PIPELINE_DIR", "pipeline"))
+EVENT_EVAL_DIR = Path(os.getenv("TS_EVENT_EVAL_DIR", "event_evaluation_results"))
+PIPELINE_STAGE_DIRS = {
+    "inputs": PIPELINE_DIR / "1_ingested_inputs",
+    "normalised": PIPELINE_DIR / "2_normalised_documents",
+    "all_chunks": PIPELINE_DIR / "3_all_chunks",
+    "sampled_chunks": PIPELINE_DIR / "4_sampled_chunks",
+    "chunk_claims": PIPELINE_DIR / "5_chunk_claims",
+    "merged_claims": PIPELINE_DIR / "6_merged_claims",
+    "fact_matching": PIPELINE_DIR / "7_fact_matching",
+    "doc_outputs": PIPELINE_DIR / "8_doc_outputs",
+}
 
 TS_MAX_CHUNKS = int(os.getenv("TS_MAX_CHUNKS", "30"))
 LAMBDA_DECAY = float(os.getenv("TS_LAMBDA_DECAY", "0.002"))  # awareness decay for old exposures
@@ -389,6 +403,37 @@ def sample_chunks(chunks: List[str], k: int) -> List[str]:
     return out[:k]
 
 
+def sample_chunks_with_indices(chunks: List[str], k: int) -> List[Tuple[int, str]]:
+    """Return sampled chunks together with their original 1-based chunk numbers.
+
+    The plain `sample_chunks` helper is still useful when we only need the text.
+    This companion helper exists so we can write clear pipeline artifacts showing
+    which original chunks were kept for the LLM stage.
+    """
+    if len(chunks) <= k:
+        return [(i + 1, chunk) for i, chunk in enumerate(chunks)]
+
+    candidate_indices = []
+    candidate_indices.extend(range(0, max(1, k // 3)))
+
+    mid_start = max(0, len(chunks) // 2 - max(1, k // 6))
+    candidate_indices.extend(range(mid_start, min(len(chunks), mid_start + max(1, k // 3))))
+
+    tail_count = max(1, k // 3)
+    candidate_indices.extend(range(max(0, len(chunks) - tail_count), len(chunks)))
+
+    out: List[Tuple[int, str]] = []
+    seen = set()
+    for idx in candidate_indices:
+        if idx in seen or idx >= len(chunks):
+            continue
+        seen.add(idx)
+        out.append((idx + 1, chunks[idx]))
+        if len(out) >= k:
+            break
+    return out
+
+
 # -----------------------------
 # DB schema
 # -----------------------------
@@ -518,11 +563,38 @@ def init_db(conn: sqlite3.Connection) -> None:
     );
     """)
 
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS event_evaluation_runs (
+        eval_run_id TEXT PRIMARY KEY,
+        ticker TEXT NOT NULL,
+        market_ticker TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        out_csv_path TEXT NOT NULL,
+        estimation_days INTEGER NOT NULL,
+        buffer_days INTEGER NOT NULL,
+        row_count INTEGER NOT NULL,
+        summary_json TEXT NOT NULL
+    );
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS event_evaluation_rows (
+        eval_row_id TEXT PRIMARY KEY,
+        eval_run_id TEXT NOT NULL,
+        doc_id TEXT NOT NULL,
+        row_json TEXT NOT NULL,
+        FOREIGN KEY(eval_run_id) REFERENCES event_evaluation_runs(eval_run_id),
+        FOREIGN KEY(doc_id) REFERENCES docs(doc_id)
+    );
+    """)
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_ticker ON facts(ticker);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_exposures_fact ON exposures(fact_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_ticker_time ON docs(ticker, timestamp);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_docclaims_doc ON doc_claims(doc_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_resolutions_source ON resolutions(source_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_event_eval_rows_run ON event_evaluation_rows(eval_run_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_event_eval_rows_doc ON event_evaluation_rows(doc_id);")
 
     conn.commit()
 
@@ -540,6 +612,83 @@ def sha256_file(path: Path) -> str:
                 break
             h.update(b)
     return h.hexdigest()
+
+
+def safe_file_stem(name: str) -> str:
+    """Convert a free-form name into a file-safe stem.
+
+    We keep the rule intentionally simple so pipeline artifact names stay readable.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_")
+    return cleaned or "document"
+
+
+def model_to_dict(obj: Any) -> Dict[str, Any]:
+    """Convert a Pydantic model-like object into a plain dictionary."""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "dict"):
+        return obj.dict()
+    if isinstance(obj, dict):
+        return obj
+    raise TypeError(f"Cannot convert object of type {type(obj)} to dict")
+
+
+def _json_default(value: Any) -> Any:
+    """Best-effort JSON serializer for numpy/path/datetime helper types."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serialisable")
+
+
+def ensure_pipeline_dirs() -> None:
+    """Create all pipeline output directories if they do not already exist."""
+    for path in list(PIPELINE_STAGE_DIRS.values()) + [EVENT_EVAL_DIR]:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def clear_directory_contents(path: Path) -> None:
+    """Delete everything inside a directory, but keep the directory itself.
+
+    We preserve `.gitkeep` so the repo can still track otherwise-empty folders.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    for child in path.iterdir():
+        if child.name == ".gitkeep":
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def clear_pipeline_outputs() -> None:
+    """Reset every pipeline stage directory to an empty state."""
+    ensure_pipeline_dirs()
+    for stage_dir in PIPELINE_STAGE_DIRS.values():
+        clear_directory_contents(stage_dir)
+
+
+def write_text_file(path: Path, text: str) -> None:
+    """Write a UTF-8 text artifact, creating parent directories on demand."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def write_json_file(path: Path, payload: Any) -> None:
+    """Write a pretty JSON artifact for human inspection."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
 
 
 def utc_now() -> dt.datetime:
@@ -922,6 +1071,217 @@ def impact_now(ts_coef: float, p_true: float, horizon: Dict[str, float], age_day
     return float(ts_coef * p_true * awareness_now * total)
 
 
+# -----------------------------
+# Lightweight pragmatics / measurement helpers
+# -----------------------------
+# These helpers intentionally use simple regex rules. The goal is not to solve
+# full semantic parsing, but to catch the most obvious measurable statements
+# without adding new dependencies or a large amount of code.
+
+_NUMBER_RE = re.compile(
+    r'(?P<currency>[$£€])?\s*(?P<value>\d+(?:,\d{3})*(?:\.\d+)?)\s*(?P<suffix>bn|billion|m|million|k|thousand|%|percent|bps|basis points)?',
+    flags=re.IGNORECASE,
+)
+
+_DATE_WORDS = {
+    'jan', 'january', 'feb', 'february', 'mar', 'march', 'apr', 'april',
+    'jun', 'june', 'jul', 'july', 'aug', 'august', 'sep', 'sept',
+    'september', 'oct', 'october', 'nov', 'november', 'dec', 'december',
+    'q1', 'q2', 'q3', 'q4', 'fy', 'fiscal', 'year', 'quarter',
+}
+
+_HEDGE_WORDS = [
+    'may', 'might', 'could', 'can', 'possibly', 'potentially',
+    'subject to', 'depending on', 'if', 'expects to', 'aim to',
+]
+
+_COMMIT_WORDS = [
+    'we will', 'will', 'we commit', 'commit', 'we intend', 'intend',
+    'we plan', 'plan to', 'target', 'promise',
+]
+
+
+def _count_text_hits(text: str, patterns: List[str]) -> int:
+    """Count simple phrase hits using whole-word matching where possible."""
+    total = 0
+    for p in patterns:
+        if ' ' in p:
+            total += len(re.findall(re.escape(p), text))
+        else:
+            total += len(re.findall(rf'\b{re.escape(p)}\b', text))
+    return total
+
+
+def strip_numeric_surface(text: str) -> str:
+    """Replace numeric expressions with a marker.
+
+    This gives us a simple "metric skeleton" for fuzzy matching. Example:
+    - "Revenue was $9 billion in 2025" -> "Revenue was <NUM> in <NUM>"
+    """
+    out = _NUMBER_RE.sub(' <NUM> ', text.lower())
+    out = re.sub(r'\s+', ' ', out).strip()
+    return out
+
+
+def parse_simple_measurements(text: str) -> List[float]:
+    """Parse a few numeric expressions into plain floats.
+
+    Heuristics are intentionally light-weight:
+    - 9bn / 9 billion -> 9_000_000_000
+    - 3m / 3 million -> 3_000_000
+    - 12% -> 12
+    - 150 bps -> 150
+
+    We keep only the first few measurements because they are mainly used as a
+    coarse signal for how measurable / changing a claim is.
+    """
+    out: List[float] = []
+    for m_num in _NUMBER_RE.finditer(text):
+        raw_val = (m_num.group('value') or '').replace(',', '')
+        suffix = (m_num.group('suffix') or '').lower().strip()
+        try:
+            val = float(raw_val)
+        except Exception:
+            continue
+
+        if suffix in {'bn', 'billion'}:
+            val *= 1_000_000_000.0
+        elif suffix in {'m', 'million'}:
+            val *= 1_000_000.0
+        elif suffix in {'k', 'thousand'}:
+            val *= 1_000.0
+
+        out.append(val)
+        if len(out) >= 5:
+            break
+    return out
+
+
+def measure_features(text: str) -> Dict[str, Any]:
+    """Return simple measurability / concreteness features from raw text.
+
+    Why this helper exists:
+    - Your research question cares about measurable vs vague statements.
+    - A deterministic score is easier to understand and audit than another LLM
+      pass.
+    """
+    lower = text.lower()
+    values = parse_simple_measurements(text)
+
+    has_currency = bool(re.search(r'[$£€]|\b(usd|eur|gbp|dollars?|euros?|pounds?)\b', lower))
+    has_percent = bool(re.search(r'\b\d+(?:\.\d+)?\s*(%|percent|bps|basis points)\b', lower))
+    has_date = bool(re.search(r'\b20\d{2}\b', lower)) or any(re.search(rf'\b{re.escape(w)}\b', lower) for w in _DATE_WORDS)
+    has_unit = bool(re.search(r'\b(days?|weeks?|months?|years?|users?|customers?|stores?|employees?|units?)\b', lower))
+    has_unit = has_unit or has_currency or has_percent
+
+    hedge_count = _count_text_hits(lower, _HEDGE_WORDS)
+    commit_count = _count_text_hits(lower, _COMMIT_WORDS)
+
+    # Simple 0..1 score: numbers matter most, then dates / units.
+    measurability = 0.0
+    if values:
+        measurability += 0.45
+    if has_date:
+        measurability += 0.20
+    if has_unit:
+        measurability += 0.20
+    if len(values) >= 2:
+        measurability += 0.05
+    if has_currency and has_percent:
+        measurability += 0.10
+
+    return {
+        'values': values,
+        'has_currency': has_currency,
+        'has_percent': has_percent,
+        'has_date': has_date,
+        'has_unit': has_unit,
+        'hedge_count': hedge_count,
+        'commit_count': commit_count,
+        'measurability_0_1': float(min(1.0, measurability)),
+        # In this small demo we treat concreteness and measurability as the same
+        # family of feature. You can split them later if you want finer theory.
+        'concreteness_0_1': float(min(1.0, measurability)),
+    }
+
+
+def compare_quantitative_claims(new_text: str, old_text: str) -> Dict[str, float]:
+    """Estimate whether two similar claims differ materially in quantity.
+
+    This is the smallest useful fix for the issue you pointed out:
+    - "we made 9bn" should not look the same as "we made 3bn"
+    - both should also differ from "we made 1bn"
+
+    The logic is simple:
+    1) compare the claim skeleton with numbers removed,
+    2) if the skeletons still look similar, compare the first measurement,
+    3) turn the relative change into a 0..1 strength.
+    """
+    new_skel = strip_numeric_surface(new_text)
+    old_skel = strip_numeric_surface(old_text)
+    skeleton_sim = fuzz.token_set_ratio(new_skel, old_skel) / 100.0
+
+    new_feat = measure_features(new_text)
+    old_feat = measure_features(old_text)
+
+    if skeleton_sim < 0.82:
+        return {
+            'skeleton_sim': float(skeleton_sim),
+            'delta_strength': 0.0,
+            'mismatch_penalty': 0.0,
+        }
+
+    if not new_feat['values'] or not old_feat['values']:
+        return {
+            'skeleton_sim': float(skeleton_sim),
+            'delta_strength': 0.0,
+            'mismatch_penalty': 0.0,
+        }
+
+    new_val = float(new_feat['values'][0])
+    old_val = float(old_feat['values'][0])
+    denom = max(abs(old_val), 1.0)
+    rel_gap = abs(new_val - old_val) / denom
+
+    # log1p makes the feature smoother than a raw ratio.
+    delta_strength = min(1.0, math.log1p(rel_gap) / math.log(10.0))
+    mismatch_penalty = 0.35 * delta_strength
+
+    # If one claim looks like currency and the other looks like a percent,
+    # apply a small extra penalty.
+    if bool(new_feat['has_currency']) != bool(old_feat['has_currency']):
+        mismatch_penalty += 0.10
+    if bool(new_feat['has_percent']) != bool(old_feat['has_percent']):
+        mismatch_penalty += 0.10
+
+    return {
+        'skeleton_sim': float(skeleton_sim),
+        'delta_strength': float(min(1.0, delta_strength)),
+        'mismatch_penalty': float(min(0.60, mismatch_penalty)),
+    }
+
+
+def infer_speech_act(text: str, modality: str) -> str:
+    """Map simple corporate wording into a coarse speech-act label.
+
+    We keep this deliberately small and readable:
+    - INTENTION / promise language -> COMMISSIVE
+    - most factual / forecast language -> ASSERTIVE
+    - a few obvious imperative / formal cases -> DIRECTIVE / DECLARATIVE
+    """
+    lower = text.lower()
+
+    if modality == 'INTENTION' or any(w in lower for w in ['we will', 'we commit', 'we intend', 'we plan']):
+        return 'COMMISSIVE'
+    if any(w in lower for w in ['must ', 'should ', 'please ', 'we ask']):
+        return 'DIRECTIVE'
+    if any(w in lower for w in ['hereby', 'appoint', 'declare', 'authorize']):
+        return 'DECLARATIVE'
+    if modality in {'ASSERTION', 'FORECAST', 'CONDITIONAL', 'RISK', 'OPINION'}:
+        return 'ASSERTIVE'
+    return 'OTHER'
+
+
 def fetch_facts_for_ticker(conn: sqlite3.Connection, ticker: str) -> List[Dict[str, Any]]:
     """Load existing canonical facts for dedupe against new extracted claims."""
     cur = conn.execute(
@@ -939,33 +1299,55 @@ def fetch_facts_for_ticker(conn: sqlite3.Connection, ticker: str) -> List[Dict[s
     return rows
 
 
-def novelty_against_kb(claim_text: str, claim_vec: np.ndarray, existing: List[Dict[str, Any]]) -> Tuple[float, Optional[str], float]:
+def novelty_against_kb(
+    claim_text: str,
+    claim_vec: np.ndarray,
+    existing: List[Dict[str, Any]],
+) -> Tuple[float, Optional[str], float, float]:
     """Compute novelty vs. knowledge base and return best candidate match.
 
-    Returns `(novelty, best_fact_id, best_similarity)` where novelty is `1-sim`.
-    Similarity blends embedding proximity with fuzzy token overlap for robustness.
+    Returns:
+    - novelty
+    - best_fact_id
+    - best_similarity (after light numeric penalty)
+    - quantitative_delta (0..1)
+
+    The new `quantitative_delta` is the small but important addition: it lets the
+    system distinguish between semantically similar claims that carry very
+    different numbers.
     """
     best_sim = 0.0
     best_id: Optional[str] = None
     best_text = None
 
     for f in existing:
-        sim = cosine(claim_vec, f["embedding"])
+        sim = cosine(claim_vec, f['embedding'])
         if sim > best_sim:
             best_sim = sim
-            best_id = f["fact_id"]
-            best_text = f["canonical_text"]
+            best_id = f['fact_id']
+            best_text = f['canonical_text']
 
+    quantitative_delta = 0.0
     if best_id is not None and best_text is not None:
         fuzz_ratio = fuzz.token_set_ratio(claim_text, best_text) / 100.0
+        quant_cmp = compare_quantitative_claims(claim_text, best_text)
+        quantitative_delta = float(quant_cmp['delta_strength'])
+
         best_sim = max(best_sim, fuzz_ratio)
+        best_sim = max(0.0, best_sim - float(quant_cmp['mismatch_penalty']))
 
     novelty = float(np.clip(1.0 - best_sim, 0.0, 1.0))
-    return novelty, best_id, float(best_sim)
+    return novelty, best_id, float(best_sim), float(quantitative_delta)
 
 
-def treat_as_same_fact(embed_sim: float, fuzz_sim: float) -> bool:
-    """Decision rule for whether a new claim should merge into an existing fact."""
+def treat_as_same_fact(embed_sim: float, fuzz_sim: float, quantitative_delta: float = 0.0) -> bool:
+    """Decision rule for whether a new claim should merge into an existing fact.
+
+    Large quantitative deltas usually mean we are looking at a fresh observation
+    rather than a mere reconfirmation of the previous fact.
+    """
+    if quantitative_delta >= 0.25:
+        return False
     return (embed_sim >= EMBED_SAME_STRICT) or (embed_sim >= EMBED_SAME_LOOSE and fuzz_sim >= FUZZ_SAME_STRICT)
 
 
@@ -1338,21 +1720,28 @@ def ingest_document(
 
     `as_of` controls time-aware metrics (awareness/decay). For walk-forward simulation,
     pass `as_of=timestamp` so the system only uses information available at that time.
+
+    This version also writes human-readable pipeline artifacts after each major step.
+    The goal is simple auditability: you can open the `pipeline/` folders and inspect
+    exactly what the system saw and produced at each stage.
     """
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not set (set it in .env or your shell).")
 
     as_of = as_of or timestamp
+    ensure_pipeline_dirs()
 
     client = OpenAI()
     global STRUCTURED_PARSE_ENABLED
     if STRUCTURED_PARSE_ENABLED:
         STRUCTURED_PARSE_ENABLED = _supports_structured_parse(client)
+
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
     doc_hash = sha256_file(path)
     doc_id = f"doc_{ticker}_{doc_hash[:12]}"
+    artifact_stem = safe_file_stem(f"{path.stem}_{doc_hash[:8]}")
 
     conn.execute(
         "INSERT OR IGNORE INTO docs(doc_id,ticker,doc_type,source_type,timestamp,sha256,url) VALUES (?,?,?,?,?,?,?)",
@@ -1360,21 +1749,82 @@ def ingest_document(
     )
     conn.commit()
 
+    # ------------------------------------------------------------------
+    # Step 1: normalise the raw source into plain analysis text.
+    # ------------------------------------------------------------------
     text = normalise_to_text(path)
-    chunks = sample_chunks(chunk_text(text), TS_MAX_CHUNKS)
+    write_text_file(
+        PIPELINE_STAGE_DIRS["normalised"] / f"{artifact_stem}.txt",
+        text,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2: chunk the document, then record both the full chunk list and the
+    # subset actually sampled for the LLM.
+    # ------------------------------------------------------------------
+    all_chunks = chunk_text(text)
+    sampled_chunks_with_idx = sample_chunks_with_indices(all_chunks, TS_MAX_CHUNKS)
+
+    all_chunks_dir = PIPELINE_STAGE_DIRS["all_chunks"] / artifact_stem
+    for chunk_no, chunk_text_value in enumerate(all_chunks, start=1):
+        write_text_file(all_chunks_dir / f"chunk_{chunk_no:03d}.txt", chunk_text_value)
+    write_json_file(
+        all_chunks_dir / "chunk_index.json",
+        [
+            {
+                "chunk_no": chunk_no,
+                "char_count": len(chunk_text_value),
+                "preview": chunk_text_value[:220],
+            }
+            for chunk_no, chunk_text_value in enumerate(all_chunks, start=1)
+        ],
+    )
+
+    sampled_chunks_dir = PIPELINE_STAGE_DIRS["sampled_chunks"] / artifact_stem
+    for sampled_no, (original_chunk_no, chunk_text_value) in enumerate(sampled_chunks_with_idx, start=1):
+        write_text_file(
+            sampled_chunks_dir / f"sampled_{sampled_no:03d}_from_chunk_{original_chunk_no:03d}.txt",
+            chunk_text_value,
+        )
+    write_json_file(
+        sampled_chunks_dir / "sampled_chunk_index.json",
+        [
+            {
+                "sampled_no": sampled_no,
+                "original_chunk_no": original_chunk_no,
+                "char_count": len(chunk_text_value),
+                "preview": chunk_text_value[:220],
+            }
+            for sampled_no, (original_chunk_no, chunk_text_value) in enumerate(sampled_chunks_with_idx, start=1)
+        ],
+    )
 
     existing_facts = fetch_facts_for_ticker(conn, ticker)
 
-    # Extract
+    # ------------------------------------------------------------------
+    # Step 3: LLM extraction on each sampled chunk.
+    # ------------------------------------------------------------------
     extracted: List[ExtractedClaim] = []
-    for i, ch in enumerate(chunks):
-        print(f"[ingest] Extracting claims from chunk {i+1}/{len(chunks)} ...")
-        extracted.extend(extract_claims_from_chunk(client, ch, ticker, doc_type, source_type))
+    chunk_claims_dir = PIPELINE_STAGE_DIRS["chunk_claims"] / artifact_stem
+    for sampled_no, (original_chunk_no, chunk_text_value) in enumerate(sampled_chunks_with_idx, start=1):
+        print(f"[ingest] Extracting claims from chunk {sampled_no}/{len(sampled_chunks_with_idx)} ...")
+        chunk_claims = extract_claims_from_chunk(client, chunk_text_value, ticker, doc_type, source_type)
+        extracted.extend(chunk_claims)
+        write_json_file(
+            chunk_claims_dir / f"sampled_{sampled_no:03d}_claims.json",
+            {
+                "sampled_no": sampled_no,
+                "original_chunk_no": original_chunk_no,
+                "claims": [model_to_dict(claim) for claim in chunk_claims],
+            },
+        )
         # small pause to avoid tiny bursts to the LLM and keep console readable
         import time
         time.sleep(0.01)
 
-    # Within-doc dedup (embedding)
+    # ------------------------------------------------------------------
+    # Step 4: within-document deduplication of extracted claims.
+    # ------------------------------------------------------------------
     merged: List[ExtractedClaim] = []
     seen_vecs: List[np.ndarray] = []
     for c in extracted:
@@ -1384,38 +1834,78 @@ def ingest_document(
         seen_vecs.append(v)
         merged.append(c)
 
+    write_json_file(
+        PIPELINE_STAGE_DIRS["merged_claims"] / f"{artifact_stem}.json",
+        [model_to_dict(claim) for claim in merged],
+    )
+
     reach = float(SOURCE_REACH.get(source_type, 0.50))
     authority = float(np.clip(authority, 0.0, 1.0))
 
     pred_by_horizon = {b: 0.0 for b in HORIZON_BUCKETS}
     near_term_total = 0.0
 
-    # For UI ranking
+    # For UI ranking and pipeline artifacts.
     claim_rows: List[Dict[str, Any]] = []
+    matching_rows: List[Dict[str, Any]] = []
 
     n_new = n_known = n_reconfirmed = 0
 
+    # ------------------------------------------------------------------
+    # Step 5: match each merged claim against the KB and compute scores.
+    # ------------------------------------------------------------------
     for c in merged:
         claim_vec = embed(client, c.claim)
-        novelty, matched_id, best_sim = novelty_against_kb(c.claim, claim_vec, existing_facts)
+        novelty, matched_id, best_sim, quantitative_delta = novelty_against_kb(c.claim, claim_vec, existing_facts)
 
-        # Fuzzy similarity for same-fact decision
+        best_text = None
         fuzz_sim = 0.0
         if matched_id is not None:
             best_text = next(x["canonical_text"] for x in existing_facts if x["fact_id"] == matched_id)
             fuzz_sim = fuzz.token_set_ratio(c.claim, best_text) / 100.0
 
-        same_fact = matched_id is not None and treat_as_same_fact(embed_sim=best_sim, fuzz_sim=fuzz_sim)
+        same_fact = matched_id is not None and treat_as_same_fact(
+            embed_sim=best_sim,
+            fuzz_sim=fuzz_sim,
+            quantitative_delta=quantitative_delta,
+        )
 
         sign = polarity_to_sign(c.polarity)
         horizon = normalise_horizon(c.horizon_profile)
 
-        # Source reliability and pragmatics
-        source_id = f"{ticker}:{c.speaker_role}"
+        # Small deterministic features derived from the claim text itself.
+        # These are easy to inspect and help us move closer to the research goal
+        # without changing the overall architecture.
+        text_features = measure_features(c.claim)
+        speech_act = infer_speech_act(c.claim, c.modality)
+        score_materiality = float(min(1.0, c.materiality_0_1 * (1.0 + 0.50 * quantitative_delta)))
+        score_surprise = float(min(1.0, c.surprise_0_1 + 0.35 * quantitative_delta))
+
+        # Use a slightly more granular source id. This keeps the existing idea of
+        # source reliability, but avoids pooling every management statement for a
+        # ticker into one single bucket.
+        source_id = f"{ticker}:{source_type}:{c.speaker_role}"
         rel = get_source_reliability(conn, source_id)
         p0 = float(np.clip(c.credibility_0_1, 0.0, 1.0))
         p_prag = pragmatics_adjust(p0, c.commitment_0_1, c.conditionality_0_1, c.is_forward_looking)
         p_true_new = apply_reliability(p_prag, rel)
+
+        matching_rows.append({
+            "claim": c.claim,
+            "matched_fact_id": matched_id,
+            "matched_text": best_text,
+            "best_match_similarity": float(best_sim),
+            "fuzz_similarity": float(fuzz_sim),
+            "same_fact": bool(same_fact),
+            "quantitative_delta": float(quantitative_delta),
+            "speech_act": speech_act,
+            "measurability_0_1": float(text_features["measurability_0_1"]),
+            "concreteness_0_1": float(text_features["concreteness_0_1"]),
+            "hedge_count": int(text_features["hedge_count"]),
+            "commit_count": int(text_features["commit_count"]),
+            "source_id": source_id,
+            "source_reliability": float(rel),
+        })
 
         if not same_fact:
             fact_id = f"fact_{ticker}_{hashlib.sha256(c.claim.encode('utf-8')).hexdigest()[:16]}"
@@ -1425,20 +1915,17 @@ def ingest_document(
             try:
                 ts_coef = compute_ts_coef_enhanced(
                     sign=int(sign),
-                    materiality=float(c.materiality_0_1),
+                    materiality=float(score_materiality),
                     novelty=float(novelty),
-                    surprise=float(c.surprise_0_1),
+                    surprise=float(score_surprise),
                     credibility=float(c.credibility_0_1),
-                    p_true=float(p_true_new),            # p_true_new computed earlier in this function
+                    p_true=float(p_true_new),
                     horizon=horizon,
                     issued_at_iso=timestamp.isoformat(),
                     source_type=source_type,
                 )
-            except Exception as _e:
-                # Fallback to legacy simple coefficient if something unexpected happens
+            except Exception:
                 ts_coef = compute_ts_coef(sign, c.materiality_0_1, novelty, c.surprise_0_1)
-
-            
 
             now = utc_now().isoformat()
             conn.execute(
@@ -1565,8 +2052,19 @@ def ingest_document(
                 "conditionality_0_1": float(c.conditionality_0_1),
                 "evidential_basis": c.evidential_basis,
                 "speaker_role": c.speaker_role,
-            }
+            },
+            "speech_act": speech_act,
+            "measurability_0_1": float(text_features["measurability_0_1"]),
+            "concreteness_0_1": float(text_features["concreteness_0_1"]),
+            "hedge_count": int(text_features["hedge_count"]),
+            "commit_count": int(text_features["commit_count"]),
+            "quantitative_delta": float(quantitative_delta),
         })
+
+    write_json_file(
+        PIPELINE_STAGE_DIRS["fact_matching"] / f"{artifact_stem}.json",
+        matching_rows,
+    )
 
     # Document-level score row
     conn.execute(
@@ -1590,6 +2088,23 @@ def ingest_document(
 
     # Return top claims by impact_rank for showmanship
     claim_rows.sort(key=lambda x: abs(x["impact_rank"]), reverse=True)
+
+    write_json_file(
+        PIPELINE_STAGE_DIRS["doc_outputs"] / f"{artifact_stem}.json",
+        {
+            "doc_id": doc_id,
+            "ticker": ticker,
+            "doc_type": doc_type,
+            "source_type": source_type,
+            "timestamp": timestamp.isoformat(),
+            "n_claims": len(claim_rows),
+            "pred_by_horizon": pred_by_horizon,
+            "pred_near_term": float(near_term_total),
+            "top_claims": claim_rows[:15],
+            "all_claim_rows": claim_rows,
+        },
+    )
+
     return IngestResult(
         doc_id=doc_id,
         ticker=ticker,
@@ -1606,6 +2121,22 @@ def ingest_document(
 # -----------------------------
 # Convenience queries for UI / scripts
 # -----------------------------
+def get_doc_by_sha(sha256: str) -> Optional[Dict[str, Any]]:
+    """Look up a document row by its SHA-256 fingerprint."""
+    conn = sqlite3.connect(DB_PATH)
+    init_db(conn)
+    cur = conn.execute(
+        "SELECT doc_id, ticker, doc_type, source_type, timestamp, sha256, url FROM docs WHERE sha256 = ?",
+        (sha256,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    keys = ["doc_id", "ticker", "doc_type", "source_type", "timestamp", "sha256", "url"]
+    return dict(zip(keys, row))
+
+
 def list_docs(ticker: str) -> List[Dict[str, Any]]:
     """List ingested documents for a ticker (newest first)."""
     conn = sqlite3.connect(DB_PATH)

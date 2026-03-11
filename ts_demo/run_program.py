@@ -1,107 +1,109 @@
 """
-End-to-end demo runner for the T-S coefficient pipeline.
+End-to-end ingestion runner for the T-S coefficient pipeline.
 
 What this script does:
 1) Reads a JSON manifest of source documents (10-K/10-Q/call transcripts/etc.).
-2) Downloads each file locally (if not already present).
-3) Sends each document through `ingest_document`, which extracts claims, links them
+2) Clears the existing `pipeline/` stage outputs so the new run is easy to inspect.
+3) Downloads each source file into `pipeline/1_ingested_inputs/`.
+4) Sends each document through `ingest_document`, which extracts claims, links them
    to the knowledge base, and computes valuation-impact style scores.
-4) Prints an operator-friendly summary so an analyst can quickly inspect what changed.
+5) Prints an operator-friendly summary so an analyst can quickly inspect what changed.
 
-This file is intentionally "glue code": it wires together IO + orchestration and keeps
-business logic in `ts_system.py`.
-
-Reading guide for new contributors:
-- Configuration and manifest loading live near the top of the file.
-- `download` handles network IO only.
-- `main` is the walk-forward orchestration loop and reporting surface.
+This file is intentionally glue code: network IO + orchestration live here, while
+business logic stays in `ts_system.py`.
 """
 
+from __future__ import annotations
+
 import datetime as dt
+import json
 import os
 import time
 from pathlib import Path
-import json
+from typing import Dict, List
 
 import requests
 from dotenv import load_dotenv
 
-from ts_system import ingest_document
+from ts_system import PIPELINE_STAGE_DIRS, clear_pipeline_outputs, ensure_pipeline_dirs, ingest_document
 
 load_dotenv()
 
-OUTDIR = Path("ingested_inputs")
-OUTDIR.mkdir(parents=True, exist_ok=True)
+# All downloaded source files are stored in the first pipeline stage directory.
+OUTDIR = PIPELINE_STAGE_DIRS["inputs"]
+ensure_pipeline_dirs()
 
-SEC_UA = os.environ.get("SEC_USER_AGENT", "GOOGL-demo/1.0 (my.email@example.com)")
+# SEC requests should use a descriptive user-agent string.
+SEC_UA = os.environ.get("SEC_USER_AGENT", "TS-demo/1.0 (my.email@example.com)")
 
 
-def load_docs_from_json(path: str | Path = "googl_docs.json"):
+def load_docs_from_json(path: str | Path = "docs.json") -> List[Dict[str, object]]:
+    """Load a list of document descriptors from a JSON manifest.
+
+    Expected fields per item:
+    - name
+    - url
+
+    Optional fields:
+    - suffix
+    - ticker
+    - doc_type
+    - source_type
+    - timestamp
+    - authority
+
+    We keep this parser strict for required fields so bad manifests fail early.
     """
-    Load a list of doc descriptors from a JSON file and normalise fields:
-      - timestamp -> datetime with tzinfo
-      - suffix defaulted from URL if missing
-      - authority defaulted to 1.0
-    Returns a list of dicts matching the previous DOCS structure.
+    manifest_path = Path(path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Docs JSON not found: {manifest_path.resolve()}")
 
-    Notes for maintainers:
-    - We keep this parser strict for required fields so bad manifests fail early.
-    - Defaults are intentionally conservative to keep demo runs reproducible.
-    """
-    # Resolve and validate the manifest path first so any config mistakes fail fast.
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Docs JSON not found: {p.resolve()}")
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    docs: List[Dict[str, object]] = []
 
-    raw = json.loads(p.read_text(encoding="utf-8"))
-    docs = []
-    # Parse each descriptor defensively so malformed entries are caught with clear errors.
     for item in raw:
         if not isinstance(item, dict):
             raise ValueError("Each item in docs JSON must be an object/dict.")
-        # Required: name and url
+
         name = item.get("name")
         url = item.get("url")
         if not name or not url:
             raise ValueError("Each doc entry must contain at least 'name' and 'url' fields.")
+
         suffix = item.get("suffix")
         if not suffix:
-            # infer from URL path
-            suf = Path(url).suffix
-            suffix = suf if suf else ".html"
-        ticker = item.get("ticker", "UNKNOWN").upper()
-        doc_type = item.get("doc_type", "UNKNOWN")
-        source_type = item.get("source_type", "SEC_FILING")
+            inferred_suffix = Path(str(url)).suffix
+            suffix = inferred_suffix if inferred_suffix else ".html"
+
+        ticker = str(item.get("ticker", "UNKNOWN")).upper()
+        doc_type = str(item.get("doc_type", "UNKNOWN"))
+        source_type = str(item.get("source_type", "SEC_FILING"))
+        authority = float(item.get("authority", 1.0))
+
         ts_str = item.get("timestamp")
-        # Timestamps are expected in ISO format; we accept either timezone-aware
-        # strings or naive ones (fallback assumes UTC).
         if ts_str:
             try:
-                timestamp = dt.datetime.fromisoformat(ts_str)
+                timestamp = dt.datetime.fromisoformat(str(ts_str))
             except Exception:
-                # try naive parse (no timezone)
-                timestamp = dt.datetime.fromisoformat(ts_str + "+00:00")
+                timestamp = dt.datetime.fromisoformat(str(ts_str) + "+00:00")
         else:
             timestamp = dt.datetime.now(dt.timezone.utc)
-        authority = float(item.get("authority", 1.0))
-        # Shape each manifest entry into the exact dict expected by the rest
-        # of the ingestion flow.
-        docs.append({
-            "name": name,
-            "url": url,
-            "suffix": suffix,
-            "ticker": ticker,
-            "doc_type": doc_type,
-            "source_type": source_type,
-            "timestamp": timestamp,
-            "authority": authority
-        })
+
+        docs.append(
+            {
+                "name": str(name),
+                "url": str(url),
+                "suffix": str(suffix),
+                "ticker": ticker,
+                "doc_type": doc_type,
+                "source_type": source_type,
+                "timestamp": timestamp,
+                "authority": authority,
+            }
+        )
+
     return docs
 
-# Resolve manifest path from env for easy scenario switching in demos/tests.
-# Example: DOCS_JSON_PATH=docs_alt.json python ts_demo/run_ingest.py
-DOCS_JSON_PATH = os.environ.get("DOCS_JSON_PATH", "docs.json")
-DOCS = load_docs_from_json(DOCS_JSON_PATH)
 
 def download(url: str, outpath: Path) -> None:
     """Download a source file to disk.
@@ -109,52 +111,53 @@ def download(url: str, outpath: Path) -> None:
     SEC endpoints prefer a descriptive User-Agent, so we add one for sec.gov URLs.
     """
     headers = {"User-Agent": SEC_UA} if "sec.gov" in url else {}
-    r = requests.get(url, headers=headers, timeout=60)
-    r.raise_for_status()
-    outpath.write_bytes(r.content)
+    response = requests.get(url, headers=headers, timeout=60)
+    response.raise_for_status()
+    outpath.write_bytes(response.content)
 
 def main() -> None:
-    """Run the walk-forward ingestion loop and print a compact analyst summary.
+    """Run the walk-forward ingestion loop and print a compact analyst summary."""
+    # Resolve the manifest at runtime so environment changes are picked up each time.
+    docs_json_path = os.environ.get("DOCS_JSON_PATH", "docs.json")
+    docs = load_docs_from_json(docs_json_path)
 
-    The printed output is designed for quick human triage: for each document we show
-    horizon predictions, near-term aggregate score, and top ranked claims.
-    """
-    # Echo key runtime config so saved logs are self-describing and reproducible.
-    print("DB:", os.environ.get("TS_DB_PATH"))
+    # Clear previous pipeline stage outputs at the start of each run so the folder
+    # tree always reflects just the current ingestion pass.
+    clear_pipeline_outputs()
+    ensure_pipeline_dirs()
+
+    print("DB:", os.environ.get("TS_DB_PATH", "system_db.sqlite3"))
     print("LLM Model Used:", os.environ.get("OPENAI_MODEL"))
     print("Embed Model Used:", os.environ.get("OPENAI_EMBED_MODEL"))
-    # Process documents in chronological order supplied by the manifest so results
-    # resemble a walk-forward analyst workflow.
-    for i, d in enumerate(DOCS, start=1):
+    print("Docs manifest:", docs_json_path)
+    print("Pipeline root:", OUTDIR.parent)
+
+    total_docs = len(docs)
+
+    # Process documents in manifest order so results resemble a walk-forward run.
+    for i, d in enumerate(docs, start=1):
         path = OUTDIR / f"{i:02d}_{d['name']}{d['suffix']}"
 
-        # Skip network work when the file has already been downloaded locally.
-        if not path.exists():
-            print(f"\n[{i}/7] Downloading {d['name']} ...")
-            download(d["url"], path)
-            time.sleep(0.8)  # polite throttle
+        print(f"\n[{i}/{total_docs}] Downloading {d['name']} ...")
+        download(str(d["url"]), path)
+        time.sleep(0.8)  # polite throttle
 
-        print(f"[{i}/7] Ingesting {d['name']} @ {d['timestamp'].isoformat()} ...")
-        # `as_of` is set to the same document timestamp to emulate a realistic
-        # "what was known at that time" run.
+        print(f"[{i}/{total_docs}] Ingesting {d['name']} @ {d['timestamp'].isoformat()} ...")
         res = ingest_document(
             path=path,
-            ticker=d["ticker"],
-            doc_type=d["doc_type"],
-            source_type=d["source_type"],
-            timestamp=d["timestamp"],
-            authority=d["authority"],
-            url=d["url"],
-            as_of=d["timestamp"],  # walk-forward
+            ticker=str(d["ticker"]),
+            doc_type=str(d["doc_type"]),
+            source_type=str(d["source_type"]),
+            timestamp=d["timestamp"],  # type: ignore[arg-type]
+            authority=float(d["authority"]),
+            url=str(d["url"]),
+            as_of=d["timestamp"],  # type: ignore[arg-type]
         )
 
         print("Doc pred_by_horizon:", {k: round(v, 6) for k, v in res.pred_by_horizon.items()})
         print("Doc pred_near_term:", round(res.pred_near_term, 6))
-        # We print only the top few claims for readability in terminal output.
         print("Top 5 claims by |impact_rank|:")
         for c in res.top_claims[:5]:
-            # Defensive handling: sometimes an item may be a string (or otherwise malformed).
-            # Keep output robust even if upstream return schema changes slightly.
             if isinstance(c, dict):
                 status = c.get("status", "UNKNOWN")
                 impact_rank = float(c.get("impact_rank", 0.0))
@@ -163,7 +166,6 @@ def main() -> None:
                 ts_coef = float(c.get("ts_coef", 0.0))
                 claim_text = str(c.get("claim", ""))[:140]
             else:
-                # Debug print for unexpected formats (prints once)
                 print("[debug] Warning: top_claim element not a dict; showing raw repr")
                 print(repr(c)[:400])
                 status = "MALFORMED"
@@ -173,9 +175,12 @@ def main() -> None:
                 ts_coef = 0.0
                 claim_text = str(c)[:140]
 
-            print(f"  - [{status}] impact_rank={impact_rank:+.4f} "
-                  f"delta_aw={delta_aw:.3f} p_true={p_true:.2f} ts_coef={ts_coef:+.3f} :: "
-                  f"{claim_text}")
+            print(
+                f"  - [{status}] impact_rank={impact_rank:+.4f} "
+                f"delta_aw={delta_aw:.3f} p_true={p_true:.2f} ts_coef={ts_coef:+.3f} :: "
+                f"{claim_text}"
+            )
+
 
 if __name__ == "__main__":
     main()

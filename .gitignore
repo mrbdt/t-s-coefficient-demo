@@ -1,6 +1,9 @@
 # secrets
 .env
 
+# the pipeline
+pipeline/
+
 # python
 __pycache__/
 
